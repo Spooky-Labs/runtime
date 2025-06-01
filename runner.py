@@ -11,7 +11,7 @@ from datetime import datetime
 from data_feed import PubSubMarketDataFeed
 from broker import AlpacaPaperTradingBroker
 from agent.agent import Agent
-# from fmel_observer import FMELObserver
+from fmel_observer import FMELObserver
 
 # Configure logging
 logging.basicConfig(
