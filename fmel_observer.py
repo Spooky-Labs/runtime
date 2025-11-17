@@ -1,17 +1,21 @@
 # fmel_observer.py
 import backtrader as bt
 import json
+import logging
+from datetime import datetime
 from google.cloud import pubsub_v1
+
+logger = logging.getLogger(__name__)
 
 class FMELObserver(bt.Observer):
     """
     Foundation Model Explainability Layer Observer
     
-    Records trading decisions with market context for explainability.
-    Follows Backtrader's observer lifecycle: prenext -> nextstart -> next.
+    Records every data exposure and agent response across all lifecycle methods.
+    Captures complete state regardless of indicator readiness.
     """
     
-    lines = ('action',)  # -1: NET_SELL, 0: HOLD, 1: NET_BUY
+    lines = ('action',)
     
     params = (
         ('agent_id', None),
@@ -20,7 +24,8 @@ class FMELObserver(bt.Observer):
     )
     
     def __init__(self):
-        # Pub/Sub setup
+        logger.info("Observer init method called")
+
         self.publisher = None
         if self.p.project_id:
             try:
@@ -30,158 +35,145 @@ class FMELObserver(bt.Observer):
                     self.p.topic_name
                 )
             except Exception as e:
-                print(f"FMEL: Pub/Sub init failed: {e}")
-    
+                logger.error(f"FMEL: Pub/Sub init failed: {e}")
+        
+        self.bar_count = 0
+        self.session_id = f"{self.p.agent_id}_{int(datetime.utcnow().timestamp())}"
+        
     def prenext(self):
-        """
-        Called before minimum period is met.
-        DO NOTHING - wait for all data feeds to be ready.
-        This prevents IndexError when feeds are out of sync.
-        """
-        pass
+        """Record pre-strategy observations"""
+        logger.info("Observer prenext method called")
+        self.bar_count += 1
+        # self._record_observation('PRENEXT')
     
     def nextstart(self):
-        """
-        Called once when minimum period is first met.
-        Default behavior calls next() - let it happen.
-        """
-        self.next()
+        """Record first tradeable observation"""
+        logger.info("Observer nextstart method called")
+        # self._record_observation('NEXTSTART')
+        # self.next()  # Continue to next() processing
     
     def next(self):
-        """Process bar after strategy execution."""
+        """Record standard observations"""
+        logger.info("Observer next method called")
+        if self.bar_count > 0:  # Skip if nextstart already incremented
+            self.bar_count += 1
+        # self._record_observation('NEXT')
+    
+    def _record_observation(self, stage):
+        """Capture and publish complete state snapshot"""
+        logger.info("Observer _record_observation method called")
         strategy = self._owner
         
-        # Get executed orders
-        executed_orders = self._get_executed_orders(strategy)
-        
-        # Classify action
-        action, net_change = self._classify_action(executed_orders)
-        self.lines.action[0] = {'NET_SELL': -1, 'HOLD': 0, 'NET_BUY': 1}[action]
-        
-        # Build decision record
-        decision = self._build_decision_record(
-            strategy, executed_orders, action, net_change
-        )
-        
-        # Publish if orders executed
-        if executed_orders and self.publisher and decision:
-            self._publish_decision(decision)
-    
-    def _get_executed_orders(self, strategy):
-        """Extract executed orders."""
-        executed = []
-        
-        for order in strategy._orderspending:
-            if order.executed.size > 0:
-                executed.append({
-                    'symbol': order.data._name,
-                    'action': 'BUY' if order.isbuy() else 'SELL',
-                    'size': order.executed.size,
-                    'price': order.executed.price,
-                })
-        
-        return executed
-    
-    def _classify_action(self, executed_orders):
-        """Determine net action from orders."""
-        if not executed_orders:
-            return 'HOLD', 0
-        
-        total_bought = sum(o['size'] for o in executed_orders if o['action'] == 'BUY')
-        total_sold = sum(o['size'] for o in executed_orders if o['action'] == 'SELL')
-        net_change = total_bought - total_sold
-        
-        if net_change > 0:
-            return 'NET_BUY', net_change
-        elif net_change < 0:
-            return 'NET_SELL', net_change
-        else:
-            return 'HOLD', 0
-    
-    def _capture_market_data(self, strategy):
-        """Safely extract market data from all feeds."""
-        market_data = {}
-        
+        # Capture all data feeds - same structure in prenext/next
+        data_state = {}
         for data in strategy.datas:
-            symbol = data._name
-            snapshot = {}
+            feed_state = {}
             
-            # Check line length before accessing
-            if len(data.close):
-                snapshot['close'] = float(data.close[0])
-            if len(data.close) > 1:
-                snapshot['prev_close'] = float(data.close[-1])
-            
-            # Other price lines might have different lengths
-            if hasattr(data, 'open') and len(data.open):
-                snapshot['open'] = float(data.open[0])
-            if hasattr(data, 'high') and len(data.high):
-                snapshot['high'] = float(data.high[0])
-            if hasattr(data, 'low') and len(data.low):
-                snapshot['low'] = float(data.low[0])
-            if hasattr(data, 'volume') and len(data.volume):
-                snapshot['volume'] = float(data.volume[0])
-            
-            market_data[symbol] = snapshot
+            # Capture every line in the feed
+            for line_name in data.lines.getlinealiases():
+                if line_name == 'datetime':
+                    continue
+                    
+                line = getattr(data.lines, line_name)
+                if len(line) > 0:
+                    feed_state[line_name] = float(line[0])
+                else:
+                    feed_state[line_name] = None
+                    
+            data_state[data._name] = feed_state
         
-        return market_data
-    
-    def _extract_indicators(self, strategy):
-        """Extract indicator values from data feeds."""
+        # Capture indicators - may be invalid but still have values
         indicators = {}
-        
         for data in strategy.datas:
-            # Check common indicator names
-            for ind_name in ['sma', 'ema', 'fast_ma', 'slow_ma', 'crossover']:
-                if hasattr(data, ind_name):
-                    ind = getattr(data, ind_name)
-                    if isinstance(ind, bt.Indicator) and len(ind):
-                        indicators[f"{data._name}_{ind_name}"] = float(ind[0])
+            for attr_name in dir(data):
+                attr = getattr(data, attr_name)
+                if isinstance(attr, bt.Indicator) and len(attr) > 0:
+                    indicators[f"{data._name}_{attr_name}"] = float(attr[0])
         
-        return indicators
-    
-    def _build_decision_record(self, strategy, executed_orders, action, net_change):
-        """Assemble decision context."""
-        # Safe timestamp
-        try:
-            timestamp = self.data.datetime.datetime(0).isoformat()
-        except:
-            from datetime import datetime
-            timestamp = datetime.utcnow().isoformat()
-        
-        return {
-            'timestamp': timestamp,
-            'agent_id': self.p.agent_id,
-            
-            # Market context
-            'market_data': self._capture_market_data(strategy),
-            'indicators': self._extract_indicators(strategy),
-            
-            # Portfolio state
+        # Capture portfolio state
+        portfolio = {
+            'cash': strategy.broker.getcash(),
+            'value': strategy.broker.getvalue(),
             'positions': {
                 d._name: strategy.getposition(d).size 
                 for d in strategy.datas
-            },
-            'portfolio': {
-                'cash': strategy.broker.getcash(),
-                'value': strategy.broker.getvalue()
-            },
-            
-            # Trading actions
-            'orders': executed_orders,
-            'net_action': action,
-            'net_position_change': net_change
+                if strategy.getposition(d).size != 0
+            }
         }
+        
+        # Capture executed orders (only possible in NEXT/NEXTSTART)
+        orders = []
+        action = 'INACTIVE' if stage == 'PRENEXT' else 'HOLD'
+        
+        if stage != 'PRENEXT':
+            current_dt = strategy.datetime[0]
+            for order in strategy._orderspending:
+                if order.executed.size > 0 and order.executed.dt == current_dt:
+                    orders.append({
+                        'symbol': order.data._name,
+                        'side': 'BUY' if order.isbuy() else 'SELL',
+                        'size': order.executed.size,
+                        'price': order.executed.price,
+                    })
+            
+            # Determine action from orders
+            if orders:
+                buys = sum(o['size'] for o in orders if o['side'] == 'BUY')
+                sells = sum(o['size'] for o in orders if o['side'] == 'SELL')
+                if buys > sells:
+                    action = 'BUY'
+                elif sells > buys:
+                    action = 'SELL'
+                else:
+                    action = 'HOLD'
+        
+        # Update line
+        action_map = {'INACTIVE': -2, 'SELL': -1, 'HOLD': 0, 'BUY': 1}
+        self.lines.action[0] = action_map.get(action, 0)
+        
+        # Build observation
+        observation = {
+            'session_id': self.session_id,
+            'agent_id': self.p.agent_id,
+            'bar': self.bar_count,
+            'stage': stage,
+            'timestamp': self._get_timestamp(),
+            'data': data_state,
+            'indicators': indicators,
+            'portfolio': portfolio,
+            'orders': orders,
+            'action': action
+        }
+        
+        # Publish
+        self._publish(observation)
     
-    def _publish_decision(self, decision):
-        """Publish to Pub/Sub."""
+    def _get_timestamp(self):
+        """Extract bar timestamp or use current time"""
+        logger.info("Observer _get_timestamp method called")
         try:
-            message = json.dumps(decision).encode('utf-8')
-            self.publisher.publish(
-                self.topic_path,
-                message,
-                agent_id=self.p.agent_id or 'unknown',
-                action=decision['net_action']
-            )
+            return self.data.datetime.datetime(0).isoformat()
         except:
-            pass  # Silent failure
+            return datetime.utcnow().isoformat()
+    
+    def _publish(self, observation):
+        """Publish to Pub/Sub"""
+        logger.info("Observer _publish method called")
+        # if not self.publisher:
+        #     return
+            
+        # try:
+        #     message = json.dumps(observation).encode('utf-8')
+        #     self.publisher.publish(
+        #         self.topic_path,
+        #         message,
+        #         **{k: str(v) for k, v in {
+        #             'session_id': observation['session_id'],
+        #             'agent_id': observation['agent_id'],
+        #             'stage': observation['stage'],
+        #             'action': observation['action'],
+        #             'bar': observation['bar']
+        #         }.items()}
+        #     )
+        # except Exception as e:
+        #     logger.error(f"FMEL: Publish failed: {e}")

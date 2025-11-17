@@ -66,6 +66,13 @@ def run_agent():
     cerebro.setbroker(broker)
     
     # Add FMEL Observer
+    # observer = FMELObserver(
+    #     agent_id=agent_id,
+    #     project_id=project_id,
+    #     topic_name='fmel-decisions'
+    # )
+    # cerebro.addobserver(observer)
+    
     cerebro.addobserver(
         FMELObserver,
         agent_id=agent_id,

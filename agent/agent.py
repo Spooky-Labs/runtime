@@ -19,6 +19,7 @@ class Agent(bt.Strategy):
     
     def start(self):
         logger.info("Start method called")
+        logger.info(self.datas[0].__dict__)
         return super().start()
     
     def stop(self):
