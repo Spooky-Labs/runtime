@@ -1,8 +1,0 @@
-export ALPACA_API_KEY='CKI6JH8CDEZIIO3T7BK5'
-export ALPACA_SECRET_KEY='X4TCzbWAcmkabqps7XRpc7vIk7oasVlmFwbdmCGo'
-export ALPACA_ACCOUNT_ID='105830c9-e690-4549-8d66-3048a3c5c6a2'
-export GOOGLE_CLOUD_PROJECT='the-farm-neutrino'
-export AGENT_ID='AGENT_ID'
-export POLL_INTERVAL=60
-
-python runner.py

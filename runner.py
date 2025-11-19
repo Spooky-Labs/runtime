@@ -1,139 +1,346 @@
 #!/usr/bin/env python3
-import backtrader as bt
-import logging
-import time
-import signal
-import sys
-import os
-from datetime import datetime
+"""
+Trading Runtime - Main Orchestrator
 
-# Import our custom components
+This is the entry point for the paper trading platform. It orchestrates all components
+needed to run a live trading agent:
+
+1. **Data Feeds**: Stream real-time market data from Google Pub/Sub
+2. **Broker**: Execute trades via Alpaca's paper trading API
+3. **FMEL Analyzer**: Track all trading decisions for explainability
+4. **Agent Strategy**: The trading logic that makes buy/sell decisions
+
+The runtime is designed for production use in Kubernetes with:
+- Graceful shutdown on SIGINT/SIGTERM
+- Automatic credential management via Secret Manager
+- Configurable via environment variables
+
+Typical deployment flow:
+  User uploads agent → Cloud Build tests → K8s deployment → This runtime starts
+"""
+
+import os
+import sys
+import signal
+import logging
+from typing import List
+
+import backtrader as bt
+from google.cloud import secretmanager
+
+# Import custom components - each handles a specific responsibility:
+# - data_feed: Streams market data from Pub/Sub into Backtrader format
+# - broker: Translates Backtrader orders to Alpaca API calls
+# - agent: Contains the actual trading strategy (replaceable by user code)
+# - fmel_analyzer: Records all decisions to BigQuery for explainability
+# - access_tracker: Tracks which data fields the agent looked at
 from data_feed import PubSubMarketDataFeed
 from broker import AlpacaPaperTradingBroker
 from agent.agent import Agent
-from fmel_observer import FMELObserver
+from fmel_analyzer import FMELAnalyzer
+from access_tracker import AccessTracker
 
-# Configure logging
+# Configure logging to stdout for Kubernetes log aggregation.
+# Using a simple format that works well with Cloud Logging.
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger('trading_agent')
 
-# Configuration - use environment variables in production
-api_key = os.environ.get('ALPACA_API_KEY')
-secret_key = os.environ.get('ALPACA_SECRET_KEY')
-account_id = os.environ.get('ALPACA_ACCOUNT_ID')
-project_id = os.environ.get('GOOGLE_CLOUD_PROJECT')
-agent_id = os.environ.get('AGENT_ID', 'test-agent')
 
-def signal_handler(sig, frame):
-    """Handle termination signals for graceful shutdown"""
-    global running
-    logger.info("Shutdown signal received")
-    running = False
+class TradingRuntime:
+    """
+    Main runtime orchestrator for paper trading.
 
-def get_symbols():
-    """Read symbols from the symbols.txt file"""
-    try:
-        with open("symbols.txt", "r") as f:
-            return [line.strip() for line in f if line.strip()]
-    except Exception as e:
-        logger.error(f"Error reading symbols file: {e}")
-        return []
-    
-def run_agent():
-    """Main function to run the trading agent"""
-    
-    # Get symbols to trade
-    symbols = get_symbols()
-    if not symbols:
-        logger.error("No symbols found in symbols.txt")
-        return False
-    
-    logger.info(f"Starting agent with {len(symbols)} symbols")
-    
-    # Create Cerebro instance with special settings for live trading
-    cerebro = bt.Cerebro(stdstats=False)
-    cerebro.addstrategy(Agent)
-    
-    # Set up broker
-    broker = AlpacaPaperTradingBroker(
-        api_key=api_key,
-        secret_key=secret_key,
-        account_id=account_id
-    )
-    cerebro.setbroker(broker)
-    
-    # Add FMEL Observer
-    # observer = FMELObserver(
-    #     agent_id=agent_id,
-    #     project_id=project_id,
-    #     topic_name='fmel-decisions'
-    # )
-    # cerebro.addobserver(observer)
-    
-    cerebro.addobserver(
-        FMELObserver,
-        agent_id=agent_id,
-        project_id=project_id,
-        topic_name='fmel-decisions'
-    )
-    
-    # Add data feeds
-    for symbol in symbols:
-        # Determine topic name based on symbol format (crypto vs stock)
-        topic_name = 'crypto-data' if '/' in symbol else 'market-data'
-        
-        # Create data feed
-        data = PubSubMarketDataFeed(
-            project_id=project_id,
-            topic_name=topic_name,
-            symbol=symbol,
+    This class brings together all components needed for live trading:
+    - Loads configuration from environment variables
+    - Sets up the Backtrader engine (Cerebro)
+    - Manages graceful shutdown
+
+    The runtime is stateless - all configuration comes from environment
+    variables, making it easy to deploy different agents with different
+    settings in Kubernetes.
+    """
+
+    def __init__(self):
+        # =================================================================
+        # CONFIGURATION LOADING
+        # Required environment variables must be set by the deployment.
+        # In production, these come from K8s ConfigMaps and Secrets.
+        # =================================================================
+        self.project_id = os.environ['GOOGLE_CLOUD_PROJECT']
+        self.agent_id = os.environ['AGENT_ID']
+        self.account_id = os.environ['ALPACA_ACCOUNT_ID']
+
+        # Create agent-specific logger to allow filtering logs by agent in
+        # Cloud Logging when multiple agents run in the same cluster.
+        self.logger = logging.getLogger(f"runtime.{self.agent_id}")
+
+        # Parse trading symbols from comma-separated string.
+        # Default to crypto symbols since they trade 24/7 (good for testing).
+        symbols_str = os.environ.get('SYMBOLS', 'BTC/USD,ETH/USD')
+        self.symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+
+        # =================================================================
+        # CREDENTIAL MANAGEMENT
+        # Two-tier credential loading:
+        # 1. Check environment variables (for local dev and testing)
+        # 2. Fall back to Secret Manager (for production)
+        # =================================================================
+        self.api_key = os.environ.get('ALPACA_API_KEY')
+        self.secret_key = os.environ.get('ALPACA_SECRET_KEY')
+
+        if not self.api_key or not self.secret_key:
+            # In production, fetch from Google Secret Manager using Workload Identity.
+            # The pod's service account must have secretAccessor permission.
+            self.api_key = self._get_secret('RUNTIME_BROKER_API_KEY')
+            self.secret_key = self._get_secret('RUNTIME_BROKER_SECRET_KEY')
+
+        # FMEL configuration for decision tracking.
+        # decisions_v2 table includes field-level access tracking.
+        self.fmel_dataset = os.environ.get('FMEL_DATASET', 'fmel')
+        self.fmel_table = os.environ.get('FMEL_TABLE', 'decisions_v2')
+
+        # Allow configurable log verbosity for debugging.
+        log_level = os.environ.get('LOG_LEVEL', 'INFO')
+        self.logger.setLevel(getattr(logging, log_level))
+
+        # =================================================================
+        # RUNTIME STATE
+        # =================================================================
+        self.cerebro = None  # Backtrader engine, created in setup()
+        self._shutdown_requested = False
+
+        # Register handlers for graceful shutdown.
+        # SIGTERM is sent by Kubernetes during pod termination.
+        # SIGINT is sent when user presses Ctrl+C locally.
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _get_secret(self, name: str) -> str:
+        """
+        Fetch a secret from Google Secret Manager.
+
+        Uses Application Default Credentials (ADC), which automatically works with:
+        - Workload Identity in GKE (production)
+        - gcloud auth application-default login (local development)
+        - Service account key file (legacy)
+        """
+        client = secretmanager.SecretManagerServiceClient()
+        path = f"projects/{self.project_id}/secrets/{name}/versions/latest"
+        return client.access_secret_version(request={"name": path}).payload.data.decode('UTF-8')
+
+    def _signal_handler(self, signum, frame):
+        """
+        Handle termination signals for graceful shutdown.
+
+        When Kubernetes sends SIGTERM, we want to:
+        1. Stop accepting new data
+        2. Cancel pending orders (if desired)
+        3. Flush FMEL batches to BigQuery
+        4. Clean up resources
+        """
+        self.logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        self._shutdown_requested = True
+        # Note: Backtrader's Cerebro doesn't have a stop method.
+        # Cleanup happens after run() returns in _cleanup().
+
+    def setup(self):
+        """
+        Initialize the Backtrader engine with all components.
+
+        This sets up the complete trading pipeline:
+        1. Data feeds for each symbol (connected to Pub/Sub)
+        2. The Agent strategy (trading logic)
+        3. Alpaca broker for order execution
+        4. FMEL analyzer for decision tracking
+
+        Must be called before run().
+        """
+        # stdstats=False disables default observers (cash, value, trades)
+        # We use FMEL analyzer instead for more detailed tracking.
+        self.cerebro = bt.Cerebro(stdstats=False)
+
+        # Create access tracker to record which data fields the agent accesses.
+        # This enables complete explainability - we can trace exactly what
+        # data the agent "looked at" before making each decision.
+        access_tracker = AccessTracker()
+
+        # =====================================================================
+        # DATA FEEDS
+        # Create one Pub/Sub subscription per symbol to stream live market data.
+        # Symbol format determines topic: "/" means crypto (24/7), else equity.
+        # =====================================================================
+        data_feeds = []
+        for symbol in self.symbols:
+            # Route to appropriate Pub/Sub topic based on asset type.
+            # The data-ingestor service publishes to these topics.
+            topic = 'crypto-data' if '/' in symbol else 'market-data'
+
+            feed = PubSubMarketDataFeed(
+                project_id=self.project_id,
+                topic_name=topic,
+                symbol=symbol,
+                buffer_size=1000  # Buffer 1000 bars to handle processing delays
+            )
+
+            # Register feed with Backtrader. The name is used for position tracking.
+            self.cerebro.adddata(feed, name=symbol)
+            data_feeds.append(feed)
+            self.logger.debug(f"Added feed: {symbol} → {topic}")
+
+        # =====================================================================
+        # STRATEGY
+        # Add the trading strategy. This is imported from agent/agent.py and
+        # contains the actual trading logic (when to buy/sell).
+        # =====================================================================
+        self.cerebro.addstrategy(Agent)
+
+        # =====================================================================
+        # BROKER
+        # Connect to Alpaca for order execution. sandbox=True means we use
+        # paper trading - no real money is involved.
+        # =====================================================================
+        broker = AlpacaPaperTradingBroker(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            account_id=self.account_id,
+            sandbox=True,  # Always paper trading - this is a simulation platform
+            poll_interval=2.0  # Check order status every 2 seconds
         )
-        cerebro.adddata(data, name=symbol)
-        logger.info(f"Added data feed for {symbol}")
-    
-    # Record starting portfolio value
-    starting_value = cerebro.broker.getvalue()
-    logger.info(f"Initial portfolio value: ${starting_value:.2f}")
-    
-    # First initialize the strategy
-    logger.info("Initializing strategy")
+        self.cerebro.setbroker(broker)
 
-    try:
-        # Run the live trading engine
-        logger.info("Starting live trading engine...")
-        cerebro.run(live=True)
+        # =====================================================================
+        # FMEL ANALYZER
+        # Foundation Model Explainability Layer - records every decision to
+        # BigQuery with full context: what data was accessed, what action was
+        # taken, and portfolio state before/after.
+        # =====================================================================
+        self.cerebro.addanalyzer(
+            FMELAnalyzer,
+            agent_id=self.agent_id,
+            project_id=self.project_id,
+            dataset_id=self.fmel_dataset,
+            table_id=self.fmel_table,
+            batch_size=10,  # Write to BigQuery every 10 decisions
+            batch_timeout=5.0,  # Or every 5 seconds, whichever comes first
+            access_tracker=access_tracker,
+            data_feeds=data_feeds  # Analyzer wraps feeds to track access
+        )
 
-        logger.info("Trading engine finished.")
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.error(f"Error during Cerebro run: {e}", exc_info=True)
-    finally:
-        # Clean up resources
-        logger.info("Agent shutdown process starting...")
-        for data in cerebro.datas:
+    def run(self):
+        """
+        Execute the trading runtime.
+
+        This is the main loop that:
+        1. Starts receiving market data from Pub/Sub
+        2. Feeds data to the strategy bar-by-bar
+        3. Executes orders through the broker
+        4. Records decisions to FMEL
+
+        The loop runs until:
+        - The data feeds are exhausted (won't happen with live data)
+        - An error occurs
+        - A shutdown signal is received
+
+        Returns:
+            bool: True if the session was profitable or break-even
+        """
+        if not self.cerebro:
+            raise RuntimeError("Runtime not setup. Call setup() first.")
+
+        # Record initial portfolio state for P&L calculation.
+        initial_value = self.cerebro.broker.getvalue()
+        initial_cash = self.cerebro.broker.getcash()
+        self.logger.info(
+            f"Portfolio initialized - Value: ${initial_value:,.2f}, Cash: ${initial_cash:,.2f}"
+        )
+
+        try:
+            # live=True tells Backtrader this is a live data feed, not historical.
+            # This affects how it handles data timing and preloading.
+            results = self.cerebro.run(live=True)
+
+            if results and results[0]:
+                strategy = results[0]
+                self.logger.debug(f"Strategy completed: {strategy.__class__.__name__}")
+
+        except KeyboardInterrupt:
+            self.logger.info("Trading interrupted by user")
+        except Exception as e:
+            self.logger.error(f"Trading engine error: {e}", exc_info=True)
+            raise
+        finally:
+            # Always clean up resources, even on error.
+            self._cleanup()
+
+        # Calculate and log final performance.
+        final_value = self.cerebro.broker.getvalue()
+        final_cash = self.cerebro.broker.getcash()
+        pnl = final_value - initial_value
+        pnl_pct = (pnl / initial_value * 100) if initial_value else 0
+
+        self.logger.info(
+            f"Runtime stopped - Value: ${final_value:,.2f}, "
+            f"Cash: ${final_cash:,.2f}, "
+            f"P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
+        )
+
+        # Return True if profitable or break-even (used for CI/CD pass/fail).
+        return pnl >= 0
+
+    def _cleanup(self):
+        """
+        Clean up all resources on shutdown.
+
+        This is called automatically after run() completes, ensuring:
+        - Broker stops monitoring orders (stops background thread)
+        - Data feeds unsubscribe from Pub/Sub (deletes subscriptions)
+        - FMEL analyzer flushes remaining decisions to BigQuery
+
+        Important: Analyzer stop() is called automatically by Backtrader.
+        """
+        # Stop broker's background order monitoring thread.
+        if hasattr(self.cerebro.broker, 'stop'):
             try:
-                if hasattr(data, 'stop'):
-                    data.stop()
+                self.cerebro.broker.stop()
             except Exception as e:
-                logger.error(f"Error stopping data feed for {data._name}: {e}")
-        
-        logger.info("Agent shutdown complete")
-    
-    # Record final value
-    final_value = cerebro.broker.getvalue()
-    logger.info(f"Final portfolio value: ${final_value:.2f}")
+                self.logger.error(f"Error stopping broker: {e}")
 
-    return True
+        # Stop data feeds - this deletes Pub/Sub subscriptions to avoid orphans.
+        for data in self.cerebro.datas:
+            if hasattr(data, 'stop'):
+                try:
+                    data.stop()
+                except Exception as e:
+                    self.logger.error(f"Error stopping feed {data._name}: {e}")
+
+        # Note: Analyzer.stop() is called automatically by Backtrader's run().
+        # This triggers FMEL to flush any remaining batched decisions.
+
+
+def main():
+    """
+    Entry point for the trading runtime.
+
+    Exit codes:
+        0: Successful run (profitable or break-even)
+        1: Successful run but unprofitable
+        2: Runtime error/exception
+    """
+    try:
+        runtime = TradingRuntime()
+        runtime.logger.info(f"Runtime started - Symbols: {runtime.symbols}")
+
+        runtime.setup()
+        success = runtime.run()
+        sys.exit(0 if success else 1)
+
+    except Exception as e:
+        logging.getLogger('runtime').error(f"Runtime failed: {e}", exc_info=True)
+        sys.exit(2)
+
 
 if __name__ == "__main__":
-    # Register signal handlers
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run the agent
-    success = run_agent()
-    sys.exit(0 if success else 1)
+    main()

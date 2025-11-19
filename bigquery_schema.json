@@ -1,0 +1,219 @@
+[
+  {
+    "name": "session_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique session identifier for the trading run"
+  },
+  {
+    "name": "agent_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Agent identifier"
+  },
+  {
+    "name": "decision_point",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Decision point number in the session"
+  },
+  {
+    "name": "stage",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Execution stage: PRENEXT, NEXTSTART, or NEXT"
+  },
+  {
+    "name": "timestamp",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Decision timestamp (when recorded)"
+  },
+  {
+    "name": "bar_time",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "Market bar timestamp"
+  },
+  {
+    "name": "action",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Trading action summary: INACTIVE, HOLD, BUY, SELL, or action chain"
+  },
+  {
+    "name": "actions",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Ordered list of actions taken at this decision point",
+    "fields": [
+      {
+        "name": "seq",
+        "type": "INTEGER",
+        "mode": "REQUIRED",
+        "description": "Sequence number for ordering"
+      },
+      {
+        "name": "timestamp_ns",
+        "type": "INTEGER",
+        "mode": "REQUIRED",
+        "description": "Nanosecond timestamp"
+      },
+      {
+        "name": "action",
+        "type": "STRING",
+        "mode": "REQUIRED",
+        "description": "BUY or SELL"
+      },
+      {
+        "name": "symbol",
+        "type": "STRING",
+        "mode": "REQUIRED",
+        "description": "Symbol traded"
+      },
+      {
+        "name": "size",
+        "type": "FLOAT",
+        "mode": "REQUIRED",
+        "description": "Order size"
+      },
+      {
+        "name": "price",
+        "type": "FLOAT",
+        "mode": "REQUIRED",
+        "description": "Execution price"
+      },
+      {
+        "name": "value",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "Total value of order"
+      },
+      {
+        "name": "commission",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "Commission paid"
+      },
+      {
+        "name": "pnl",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "Realized P&L if closing position"
+      }
+    ]
+  },
+  {
+    "name": "portfolio_value",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Total portfolio value at decision time"
+  },
+  {
+    "name": "portfolio_cash",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Available cash at decision time"
+  },
+  {
+    "name": "data_accessed",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Data feeds and fields accessed for this decision",
+    "fields": [
+      {
+        "name": "symbol",
+        "type": "STRING",
+        "mode": "REQUIRED",
+        "description": "Symbol of data feed accessed"
+      },
+      {
+        "name": "data_hash",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "Hash of complete data point from ingestion"
+      },
+      {
+        "name": "fields_accessed",
+        "type": "STRING",
+        "mode": "REPEATED",
+        "description": "List of fields accessed (e.g., close, high, news_headline)"
+      },
+      {
+        "name": "access_patterns",
+        "type": "RECORD",
+        "mode": "REPEATED",
+        "description": "Detailed access patterns",
+        "fields": [
+          {
+            "name": "seq",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Access sequence number"
+          },
+          {
+            "name": "timestamp_ns",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Nanosecond timestamp of access"
+          },
+          {
+            "name": "field",
+            "type": "STRING",
+            "mode": "REQUIRED",
+            "description": "Field accessed"
+          },
+          {
+            "name": "index",
+            "type": "INTEGER",
+            "mode": "REQUIRED",
+            "description": "Array index (0 for current, -1 for previous)"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "access_count",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Total number of field accesses for this decision"
+  },
+  {
+    "name": "positions",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Current positions after decision",
+    "fields": [
+      {
+        "name": "symbol",
+        "type": "STRING",
+        "mode": "REQUIRED"
+      },
+      {
+        "name": "size",
+        "type": "FLOAT",
+        "mode": "REQUIRED"
+      },
+      {
+        "name": "price",
+        "type": "FLOAT",
+        "mode": "REQUIRED",
+        "description": "Average entry price"
+      },
+      {
+        "name": "value",
+        "type": "FLOAT",
+        "mode": "REQUIRED",
+        "description": "Position value"
+      }
+    ]
+  },
+  {
+    "name": "inserted_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "When record was inserted into BigQuery",
+    "defaultValueExpression": "CURRENT_TIMESTAMP()"
+  }
+]
