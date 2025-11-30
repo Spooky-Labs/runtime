@@ -13,62 +13,52 @@ The Trading Runtime provides a complete infrastructure for running trading agent
 ## Architecture
 
 ```mermaid
-graph TB
-    subgraph "External Services"
+%%{init: {'theme': 'base', 'themeVariables': {'primaryColor': '#ffe4d4', 'primaryTextColor': '#ff4500', 'primaryBorderColor': '#ff4500', 'lineColor': '#ff4500', 'tertiaryColor': '#fff5f0', 'clusterBorder': '#ff4500', 'nodeTextColor': '#ff4500', 'edgeLabelBackground': '#ffe4d4'}}}%%
+flowchart TB
+    subgraph external["External Services"]
         PubSub[Google Pub/Sub<br/>Market Data Topics]
         Alpaca[Alpaca API<br/>Paper Trading]
         BigQuery[BigQuery<br/>FMEL Storage]
         Ingestor[Crypto Data Ingestor<br/>Market Data Publisher]
     end
 
-    subgraph "Runtime Core"
+    subgraph core["Runtime Core"]
         Runner[Runner<br/>Orchestrator]
         Config[Configuration<br/>Manager]
     end
 
-    subgraph "Data Layer"
+    subgraph data["Data Layer"]
         DataFeed[PubSubMarketDataFeed<br/>Real-time Data]
         Broker[AlpacaPaperTradingBroker<br/>Order Management]
         FMEL[FMELAnalyzer<br/>Decision & Access Tracking]
     end
 
-    subgraph "Trading Logic"
+    subgraph trading["Trading Logic"]
         Agent[Agent Strategy<br/>Trading Algorithm]
         BT[Backtrader Engine]
     end
 
-    %% Data flow
     Ingestor -->|Publishes| PubSub
     PubSub -->|Subscribes| DataFeed
     DataFeed -->|Market Data| BT
 
-    %% Trading flow
     BT -->|Strategy Calls| Agent
     Agent -->|Buy/Sell Orders| Broker
     Broker <-->|Order Management| Alpaca
 
-    %% Explainability flow
     Agent -->|Decisions| FMEL
     FMEL -->|Batch Writes| BigQuery
     DataFeed -->|Data Hash| FMEL
 
-    %% Orchestration
     Runner -->|Initializes| Config
     Config -->|Configures| DataFeed
     Config -->|Configures| Broker
     Config -->|Configures| FMEL
     Runner -->|Manages| BT
 
-    %% Background processes
     Broker -.->|Background Thread<br/>Status Monitoring| Alpaca
     DataFeed -.->|Async Messages| PubSub
     FMEL -.->|Batch Timer| BigQuery
-
-    style DataFeed fill:#e1f5fe
-    style Broker fill:#fff3e0
-    style FMEL fill:#f3e5f5
-    style Agent fill:#e8f5e9
-    style Runner fill:#fce4ec
 ```
 
 ## Core Components
@@ -205,25 +195,26 @@ class Agent(bt.Strategy):
 **Architecture**:
 ```python
 class FMELAnalyzer(bt.Analyzer):
-    # Direct order tracking
+    # Direct order tracking - adds to unified event_timeline
     def notify_order(self, order):
         if order.status == order.Completed:
-            self._decision_actions.append({
-                'seq': self._action_sequence,
+            self._event_timeline.append({
+                'event_type': 'TRADE',
                 'action': 'BUY' if order.isbuy() else 'SELL',
                 'symbol': order.data._name,
                 'size': order.executed.size,
-                'price': order.executed.price
+                'price': order.executed.price,
+                'value': order.executed.value,
+                'commission': order.executed.comm,
+                'pnl': order.executed.pnl
             })
 
-    # Field-level access tracking via AccessTracker
-    def _record_decision(self, action, accessed_data):
-        decision = {
-            'decision_point': self.decision_count,
-            'actions': self._decision_actions,
-            'data_accessed': accessed_data,  # Which fields were looked at
-            'access_count': self.access_tracker.get_access_count()
-        }
+    # Builds unified timeline from data accesses and trades
+    def _build_event_timeline(self, accessed_data):
+        # Merges DATA_ACCESS events from access_tracker
+        # with TRADE events from notify_order
+        # Sorts by timestamp_ns for true chronological order
+        # Assigns global sequence numbers
 ```
 
 **Enhanced Decision Schema**:
@@ -235,17 +226,7 @@ class FMELAnalyzer(bt.Analyzer):
     "timestamp": "2024-11-18T12:00:00Z",
     "bar_time": "2024-11-18T11:59:00Z",
     "stage": "NEXT",
-    "action": "BUY(BTC/USD) → SELL(ETH/USD)",
-    "actions": [
-        {
-            "seq": 0,
-            "timestamp_ns": 1763498803000000000,
-            "action": "BUY",
-            "symbol": "BTC/USD",
-            "size": 0.05,
-            "price": 92500.0
-        }
-    ],
+    "action": "TRADED",
     "data_accessed": [
         {
             "symbol": "BTC/USD",
@@ -255,6 +236,38 @@ class FMELAnalyzer(bt.Analyzer):
                 {"seq": 0, "field": "close", "index": 0},
                 {"seq": 1, "field": "close", "index": -1}
             ]
+        }
+    ],
+    "event_timeline": [
+        {
+            "seq": 1,
+            "timestamp_ns": 1763498803000000000,
+            "event_type": "DATA_ACCESS",
+            "symbol": "BTC/USD",
+            "field": "close",
+            "index": 0,
+            "data_hash": "abc123"
+        },
+        {
+            "seq": 2,
+            "timestamp_ns": 1763498803000000001,
+            "event_type": "DATA_ACCESS",
+            "symbol": "BTC/USD",
+            "field": "close",
+            "index": -1,
+            "data_hash": "abc123"
+        },
+        {
+            "seq": 3,
+            "timestamp_ns": 1763498803100000000,
+            "event_type": "TRADE",
+            "symbol": "BTC/USD",
+            "action": "BUY",
+            "size": 0.05,
+            "price": 92500.0,
+            "value": 4625.0,
+            "commission": 0.0,
+            "pnl": null
         }
     ],
     "portfolio_value": 25731.77,
@@ -309,22 +322,28 @@ source load_env.sh
 #### Required Variables
 
 ```bash
-# Alpaca Broker API (not Trading API)
-# Get from: https://app.alpaca.markets/paper/dashboard/overview
-ALPACA_API_KEY=PKxxxxxxxxxx       # Must be Broker API key
-ALPACA_SECRET_KEY=xxxxxxxxxx      # Broker API secret
-ALPACA_ACCOUNT_ID=uuid-format      # Paper trading account ID
-
 # Google Cloud Project
 GOOGLE_CLOUD_PROJECT=project-id   # Or use PROJECT_ID
+
+# Agent Configuration
+AGENT_ID=my-trading-agent         # Required: unique agent identifier
+ALPACA_ACCOUNT_ID=uuid-format     # Required: paper trading account ID
+
+# Redis Configuration (for symbol discovery)
+REDIS_HOST=localhost              # Redis server host
+REDIS_PORT=6379                   # Redis server port
+
+# Secret Names (provided by Terraform ConfigMap in production)
+RUNTIME_API_KEY_NAME=runtime-broker-api-key
+RUNTIME_SECRET_KEY_NAME=runtime-broker-secret-key
 ```
 
 #### Optional Variables
 
 ```bash
-# Agent Configuration
-AGENT_ID=my-trading-agent         # Default: test-agent
-SYMBOLS=BTC/USD,ETH/USD          # Default: BTC/USD,ETH/USD
+# Symbol Limits (0 = unlimited, subscribes to ALL available symbols)
+MAX_EQUITY_SYMBOLS=0              # Default: 0 (all equities)
+MAX_CRYPTO_SYMBOLS=0              # Default: 0 (all crypto)
 
 # FMEL Configuration
 FMEL_DATASET=fmel                 # Default: fmel
@@ -334,12 +353,38 @@ FMEL_TABLE=decisions_v2           # Default: decisions_v2 (with field tracking)
 LOG_LEVEL=INFO                    # Default: INFO
 ```
 
-#### Production Variables (Secret Manager)
+#### Local Development Variables
 
 ```bash
-# Use Secret Manager instead of direct credentials
-BROKER_API_KEY_SECRET=secret-name
-BROKER_SECRET_KEY_SECRET=secret-name
+# For local development only - in production, use Secret Manager
+ALPACA_API_KEY=PKxxxxxxxxxx       # Broker API key (for local testing)
+ALPACA_SECRET_KEY=xxxxxxxxxx      # Broker API secret (for local testing)
+```
+
+### Symbol Discovery
+
+The runtime fetches trading symbols dynamically from Redis, which is populated by the asset-discovery service:
+
+```bash
+# Redis keys used:
+symbols:equities    # List of all tradable equity symbols
+symbols:crypto      # List of all tradable crypto symbols
+
+# Symbol limiting for testing:
+export MAX_EQUITY_SYMBOLS=10    # Only subscribe to first 10 equities
+export MAX_CRYPTO_SYMBOLS=5     # Only subscribe to first 5 crypto pairs
+
+# Default behavior (0 = unlimited):
+export MAX_EQUITY_SYMBOLS=0     # Subscribe to ALL available equities
+export MAX_CRYPTO_SYMBOLS=0     # Subscribe to ALL available crypto
+```
+
+**Important**: The runtime will fail to start if Redis contains no symbols. Ensure the asset-discovery service has run first:
+
+```bash
+# Manually trigger asset discovery if needed:
+kubectl create job --from=cronjob/equity-asset-refresh equity-manual -n paper-trading
+kubectl create job --from=cronjob/crypto-asset-refresh crypto-manual -n paper-trading
 ```
 
 ### Getting Alpaca Credentials
@@ -357,9 +402,9 @@ BROKER_SECRET_KEY_SECRET=secret-name
 
 The runtime uses a fallback configuration pattern:
 1. Direct environment variables (`ALPACA_API_KEY`)
-2. Alternative names (`PROJECT_ID` → `GOOGLE_CLOUD_PROJECT`)
-3. Google Secret Manager (for production)
-4. Default values (for optional settings)
+2. Secret names from environment (`RUNTIME_API_KEY_NAME` → Secret Manager)
+3. Google Secret Manager (for production - no hardcoded defaults)
+4. Default values (only for optional settings like LOG_LEVEL)
 
 ## Running the Runtime
 
@@ -380,14 +425,24 @@ pip install -r requirements.txt
 ### Local Development
 
 ```bash
+# Ensure Redis is running and populated with symbols
+redis-cli get symbols:equities  # Should return JSON array of symbols
+redis-cli get symbols:crypto    # Should return JSON array of crypto pairs
+
 # Load environment
 source load_env.sh
 
-# Run with default symbols (BTC/USD, ETH/USD)
+# Run with ALL available symbols (default)
 python runner.py
 
-# Run with custom symbols
-export SYMBOLS="BTC/USD,ETH/USD,AAPL,MSFT"
+# Run with limited symbols for testing
+export MAX_EQUITY_SYMBOLS=10
+export MAX_CRYPTO_SYMBOLS=5
+python runner.py
+
+# For local testing without Secret Manager:
+export ALPACA_API_KEY="your-broker-api-key"
+export ALPACA_SECRET_KEY="your-broker-secret-key"
 python runner.py
 ```
 
@@ -497,20 +552,35 @@ GROUP BY action;
 
 ### Common Issues
 
+**No Symbols Found**:
+- Ensure Redis is accessible at configured host:port
+- Verify asset-discovery service has run successfully
+- Check Redis keys: `redis-cli get symbols:equities`
+- Manual trigger: `kubectl create job --from=cronjob/equity-asset-refresh equity-manual -n paper-trading`
+
+**Secret Manager Access Denied**:
+- Verify secret names are provided via environment variables
+- Check service account has `secretAccessor` role
+- Ensure secrets exist in Secret Manager
+- For local dev, use direct ALPACA_API_KEY/ALPACA_SECRET_KEY
+
 **No Market Data**:
-- Check crypto-data-ingestor is running
+- Check data-ingestors are running (both equity and crypto)
 - Verify Pub/Sub subscription filters
 - Ensure symbols match exactly (e.g., "BTC/USD" not "BTC-USD")
+- Check Redis has symbols that match what ingestors are streaming
 
 **Order Failures**:
 - Verify Alpaca account is funded
-- Check API credentials are for paper trading
+- Check API credentials are for Broker API (not Trading API)
 - Review broker logs for rejection reasons
+- Ensure using paper trading sandbox endpoints
 
 **FMEL Not Recording**:
 - Verify BigQuery dataset/table exists
 - Check service account permissions
 - Review batch timer logs
+- Ensure decisions_v2 table schema includes field tracking
 
 **Library Compatibility**:
 - Match exact versions from backtesting container
@@ -575,3 +645,7 @@ For issues or questions:
 - Check BigQuery for FMEL decisions
 - Verify environment configuration
 - Ensure library version compatibility
+
+---
+
+Made with 🌲🌲🌲 in Cascadia

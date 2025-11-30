@@ -34,12 +34,9 @@ Example:
     # }
 """
 
-import logging
-from typing import Dict, List, Set, Any, Optional
+from typing import Dict, List, Any, Optional
 from collections import defaultdict
 import time
-
-logger = logging.getLogger(__name__)
 
 
 class AccessTracker:
@@ -99,10 +96,6 @@ class AccessTracker:
                     'access_patterns': sorted(feed_data['access_patterns'], key=lambda x: x['seq'])
                 })
         return result
-
-    def get_accessed_feed_names(self) -> Set[str]:
-        """Get set of feed names that were accessed"""
-        return set(self.accessed_feeds.keys())
 
     def get_access_count(self) -> int:
         """Get total number of field accesses"""

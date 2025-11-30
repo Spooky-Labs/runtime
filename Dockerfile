@@ -2,6 +2,10 @@ FROM gcr.io/the-farm-neutrino-315cd/base-with-models:0.1.5
 
 WORKDIR /app
 
+# Install procps for pgrep (needed by Kubernetes health checks)
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends procps && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -39,69 +39,7 @@
     "name": "action",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Trading action summary: INACTIVE, HOLD, BUY, SELL, or action chain"
-  },
-  {
-    "name": "actions",
-    "type": "RECORD",
-    "mode": "REPEATED",
-    "description": "Ordered list of actions taken at this decision point",
-    "fields": [
-      {
-        "name": "seq",
-        "type": "INTEGER",
-        "mode": "REQUIRED",
-        "description": "Sequence number for ordering"
-      },
-      {
-        "name": "timestamp_ns",
-        "type": "INTEGER",
-        "mode": "REQUIRED",
-        "description": "Nanosecond timestamp"
-      },
-      {
-        "name": "action",
-        "type": "STRING",
-        "mode": "REQUIRED",
-        "description": "BUY or SELL"
-      },
-      {
-        "name": "symbol",
-        "type": "STRING",
-        "mode": "REQUIRED",
-        "description": "Symbol traded"
-      },
-      {
-        "name": "size",
-        "type": "FLOAT",
-        "mode": "REQUIRED",
-        "description": "Order size"
-      },
-      {
-        "name": "price",
-        "type": "FLOAT",
-        "mode": "REQUIRED",
-        "description": "Execution price"
-      },
-      {
-        "name": "value",
-        "type": "FLOAT",
-        "mode": "NULLABLE",
-        "description": "Total value of order"
-      },
-      {
-        "name": "commission",
-        "type": "FLOAT",
-        "mode": "NULLABLE",
-        "description": "Commission paid"
-      },
-      {
-        "name": "pnl",
-        "type": "FLOAT",
-        "mode": "NULLABLE",
-        "description": "Realized P&L if closing position"
-      }
-    ]
+    "description": "Decision category: INACTIVE (strategy warming up), HOLD (evaluated but no trade), or TRADED (executed trades - see event_timeline for details)"
   },
   {
     "name": "portfolio_value",
@@ -178,6 +116,92 @@
     "type": "INTEGER",
     "mode": "REQUIRED",
     "description": "Total number of field accesses for this decision"
+  },
+  {
+    "name": "event_timeline",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Unified timeline of all events (data accesses and trades) in exact sequence. Enables replaying the agent's decision process step-by-step.",
+    "fields": [
+      {
+        "name": "seq",
+        "type": "INTEGER",
+        "mode": "REQUIRED",
+        "description": "Global sequence number across all event types (1, 2, 3...). Defines exact order of events."
+      },
+      {
+        "name": "timestamp_ns",
+        "type": "INTEGER",
+        "mode": "REQUIRED",
+        "description": "Nanosecond-precision timestamp when this event occurred."
+      },
+      {
+        "name": "event_type",
+        "type": "STRING",
+        "mode": "REQUIRED",
+        "description": "Type of event: 'DATA_ACCESS' (model read a field) or 'TRADE' (model executed a trade)"
+      },
+      {
+        "name": "symbol",
+        "type": "STRING",
+        "mode": "REQUIRED",
+        "description": "Asset symbol this event relates to (e.g., 'AAPL')"
+      },
+      {
+        "name": "field",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "For DATA_ACCESS: which field was read (e.g., 'close', 'volume'). NULL for TRADE events."
+      },
+      {
+        "name": "index",
+        "type": "INTEGER",
+        "mode": "NULLABLE",
+        "description": "For DATA_ACCESS: historical offset (0=current, -1=previous bar). NULL for TRADE events."
+      },
+      {
+        "name": "action",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "For TRADE: 'BUY' or 'SELL'. NULL for DATA_ACCESS events."
+      },
+      {
+        "name": "size",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "For TRADE: number of shares/units traded. NULL for DATA_ACCESS events."
+      },
+      {
+        "name": "price",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "For TRADE: execution price per share/unit. NULL for DATA_ACCESS events."
+      },
+      {
+        "name": "value",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "For TRADE: total order value (size * price). NULL for DATA_ACCESS events."
+      },
+      {
+        "name": "commission",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "For TRADE: commission/fees paid for this trade. NULL for DATA_ACCESS events."
+      },
+      {
+        "name": "pnl",
+        "type": "FLOAT",
+        "mode": "NULLABLE",
+        "description": "For TRADE: realized profit/loss if closing a position. NULL for opening trades and DATA_ACCESS events."
+      },
+      {
+        "name": "data_hash",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "For DATA_ACCESS: SHA-256 hash linking to data_registry for the data that was read. NULL for TRADE events."
+      }
+    ]
   },
   {
     "name": "positions",

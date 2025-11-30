@@ -1,18 +1,23 @@
 """
 Foundation Model Explainability Layer (FMEL) Analyzer
 
-This module records every trading decision to BigQuery for complete explainability.
+This module records every Foundation Model trading decision to BigQuery for
+complete explainability. It enables understanding "why did the AI make this trade?"
+by capturing exactly what data the model accessed before each decision.
+
 It captures:
-- What action was taken (BUY/SELL/HOLD)
-- What data the agent accessed before deciding
-- Portfolio state before and after
-- Timing information for performance analysis
+- Decision category: INACTIVE (warming up), HOLD (no trade), or TRADED (executed trades)
+- Unified event timeline: All data accesses and trades in chronological order
+- Data accessed: Which fields the model read (e.g., close price, volume, news sentiment)
+- Access patterns: Exact sequence and timing of data accesses (nanosecond precision)
+- Portfolio state: Value, cash, and positions at decision time
 
 Why FMEL:
-- Regulatory: Explain why each trade was made
+- Explainability: Show exactly what data influenced each AI trading decision
+- Reproducibility: Replay any decision with the exact same inputs the model saw
+- Regulatory: Audit trail explaining why each trade was made
 - Debugging: Trace bad decisions to their data inputs
-- Analysis: Understand agent behavior patterns
-- Auditing: Complete audit trail of all decisions
+- Analysis: Understand Foundation Model behavior patterns
 
 Architecture Decision - Analyzer vs Observer:
 We use Backtrader's Analyzer pattern instead of Observer because:
@@ -23,21 +28,20 @@ We use Backtrader's Analyzer pattern instead of Observer because:
 
 BigQuery Integration:
 Decisions are batched (10 records or 5 seconds) to reduce API calls.
-Each decision includes nested structures for actions and data access
-that map directly to BigQuery's schema (see bigquery_schema.json).
+Each decision includes a unified event_timeline with all data accesses
+and trades that map directly to BigQuery's schema (see bigquery_schema.json).
 """
 
 import backtrader as bt
 import logging
 import threading
 import time
-from collections import deque
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from google.cloud import bigquery
 from google.api_core import retry
 
-from access_tracker import AccessTracker
+from access_tracker import AccessTracker, AccessTrackingWrapper
 
 logger = logging.getLogger(__name__)
 
@@ -54,38 +58,83 @@ class FMELAnalyzer(bt.Analyzer):
     """
 
     params = (
+        # Unique identifier for this trading agent (e.g., "momentum_v2")
+        # Used to filter decisions by agent in BigQuery queries
         ('agent_id', None),
+
+        # Google Cloud project ID for BigQuery writes
         ('project_id', None),
+
+        # BigQuery dataset name - always 'fmel' for Foundation Model Explainability Layer
         ('dataset_id', 'fmel'),
+
+        # BigQuery table name - always 'decisions' (matches Infrastructure/bigquery.tf schema)
         ('table_id', 'decisions'),
+
+        # Number of decisions to buffer before flushing to BigQuery
+        # Higher values reduce API calls but increase memory usage and data loss risk
         ('batch_size', 10),
+
+        # Maximum seconds to wait before flushing partial batch
+        # Ensures timely writes even during slow trading periods
         ('batch_timeout', 5.0),
-        ('access_tracker', None),  # AccessTracker instance
-        ('data_feeds', None),  # List of data feeds to wrap
+
+        # AccessTracker instance for recording which data fields the agent reads
+        # If None, data access tracking is disabled
+        ('access_tracker', None),
+
+        # List of Backtrader data feeds to wrap with access tracking
+        # Each feed will be replaced with an AccessTrackingWrapper in start()
+        ('data_feeds', None),
     )
 
     def __init__(self):
         """Initialize the FMEL analyzer"""
         super().__init__()
 
-        # Session tracking
-        timestamp = int(time.time())
-        self.session_id = f"{self.p.agent_id}_{timestamp}"
+        # Unique identifier for this trading session, combining agent_id with
+        # nanosecond timestamp. Used to group all decisions from a single run
+        # and enables querying "show me everything from this specific backtest"
+        timestamp_ns = time.time_ns()
+        self.session_id = f"{self.p.agent_id}_{timestamp_ns}"
 
-        # Decision tracking
+        # Sequential counter of decision points within this session
+        # Increments each bar (prenext, nextstart, next) for ordering decisions
         self.decision_count = 0
-        self._current_decision = None
-        self._decision_actions = []  # Actions for current decision point
-        self._action_sequence = 0
 
-        # BigQuery setup
+        # Temporary storage for the decision currently being recorded
+        # Contains bar_time, stage, portfolio state at decision start
+        # Set in _start_decision_point(), consumed in _end_decision_point()
+        self._current_decision = None
+
+        # Collects TRADE events during a single decision point
+        # Populated by notify_order() when orders complete, then merged with
+        # DATA_ACCESS events in _build_event_timeline() for chronological replay
+        self._event_timeline = []
+
+        # BigQuery client instance, initialized in start() via _setup_bigquery()
+        # Reused for all writes during the session
         self.bq_client = None
+
+        # Reference to the BigQuery table (project.dataset.table)
+        # Set once in _setup_bigquery() and used for all batch inserts
         self.table_ref = None
-        self._batch_buffer = deque()
+
+        # Buffer holding decisions waiting to be written to BigQuery
+        # Flushed when size reaches batch_size or after batch_timeout seconds
+        self._batch_buffer = []
+
+        # Thread lock protecting _batch_buffer from concurrent access
+        # Required because _flush_batch_async() runs on a Timer thread
         self._batch_lock = threading.Lock()
+
+        # Timer that triggers batch flush after batch_timeout seconds of inactivity
+        # Ensures partial batches are written even during slow trading periods
+        # Cancelled and reset each time a new decision is added to the buffer
         self._batch_timer = None
 
-        # Access tracking
+        # Reference to the AccessTracker that records data field accesses
+        # Shared with AccessTrackingWrapper instances that wrap data feeds
         self.access_tracker = self.p.access_tracker
 
         logger.info(f"FMEL Analyzer initialized - Session: {self.session_id}")
@@ -101,8 +150,6 @@ class FMELAnalyzer(bt.Analyzer):
         # ensures the Agent doesn't encounter wrapped objects during setup,
         # while still capturing all data access during actual trading decisions.
         if self.p.data_feeds and self.access_tracker:
-            from access_tracker import AccessTrackingWrapper
-
             # Replace each data feed in strategy.datas with wrapped version
             for i, feed in enumerate(self.strategy.datas):
                 if i < len(self.p.data_feeds):
@@ -120,16 +167,25 @@ class FMELAnalyzer(bt.Analyzer):
             f"Symbols: {[d._name for d in self.strategy.datas]}"
         )
 
+        # Log session start (not written to BigQuery - doesn't match decisions schema)
+        logger.info(
+            f"Session started - "
+            f"Symbols: {[d._name for d in self.strategy.datas]}, "
+            f"Initial cash: ${self.strategy.broker.getcash():,.2f}, "
+            f"Initial value: ${self.strategy.broker.getvalue():,.2f}"
+        )
+
     def prenext(self):
         """Called before minimum period for all datas/indicators"""
         self._start_decision_point('PRENEXT')
-        self._record_decision('INACTIVE')
+        # Force INACTIVE action - strategy is warming up, can't trade yet
+        self._current_decision['forced_action'] = 'INACTIVE'
         self._end_decision_point()
 
     def nextstart(self):
         """Called exactly once when minimum period is reached"""
         self._start_decision_point('NEXTSTART')
-        self._record_decision('HOLD')
+        # No forced action - will be HOLD or TRADED based on actual trades
         self._end_decision_point()
 
     def next(self):
@@ -149,39 +205,29 @@ class FMELAnalyzer(bt.Analyzer):
         """
         if order.status == order.Completed:
             action = 'BUY' if order.isbuy() else 'SELL'
+            timestamp_ns = time.time_ns()
+            symbol = order.data._name
 
-            # Add to current decision's actions
-            self._decision_actions.append({
-                'seq': self._action_sequence,
-                'timestamp_ns': time.time_ns(),
+            # Add to unified event timeline (for replay and financial analysis)
+            self._event_timeline.append({
+                'timestamp_ns': timestamp_ns,
+                'event_type': 'TRADE',
+                'symbol': symbol,
+                'field': None,  # Not applicable for trades
+                'index': None,  # Not applicable for trades
                 'action': action,
-                'symbol': order.data._name,
-                'size': order.executed.size,
-                'price': order.executed.price,
-                'value': order.executed.value,
-                'commission': order.executed.comm,
-                'pnl': getattr(order.executed, 'pnl', None)
+                'size': float(order.executed.size),
+                'price': float(order.executed.price),
+                'value': float(order.executed.value) if order.executed.value else None,
+                'commission': float(order.executed.comm) if order.executed.comm else None,
+                'pnl': float(order.executed.pnl) if getattr(order.executed, 'pnl', None) else None,
+                'data_hash': None  # Trades don't reference data_registry
             })
-            self._action_sequence += 1
 
             logger.debug(
-                f"Order completed - {action} {order.data._name} "
+                f"Order completed - {action} {symbol} "
                 f"Size: {order.executed.size} @ {order.executed.price}"
             )
-
-    def notify_trade(self, trade):
-        """Called when a trade is opened/updated/closed"""
-        if trade.isclosed:
-            logger.debug(
-                f"Trade closed - {trade.data._name} "
-                f"PnL: {trade.pnl:+.2f}"
-            )
-
-    def notify_cashvalue(self, cash, value):
-        """More efficient portfolio tracking"""
-        # Cache for use in decision recording
-        self._cached_cash = cash
-        self._cached_value = value
 
     def _start_decision_point(self, stage: str):
         """Start tracking a new decision point"""
@@ -196,38 +242,78 @@ class FMELAnalyzer(bt.Analyzer):
             'decision_point': self.decision_count,
             'stage': stage,
             'bar_time': bt.num2date(self.strategy.datetime[0]),
-            'start_portfolio_value': self.strategy.broker.getvalue(),
-            'start_portfolio_cash': self.strategy.broker.getcash(),
         }
 
-        # Reset action tracking
-        self._decision_actions = []
-        self._action_sequence = 0
+        # Reset event timeline for new decision
+        self._event_timeline = []
 
     def _end_decision_point(self):
         """Finalize and record the decision point"""
         if not self._current_decision:
             return
 
-        # Determine final action
-        if self._decision_actions:
-            # Multiple actions - create summary
-            action_summary = ' → '.join([
-                f"{a['action']}({a['symbol']})"
-                for a in sorted(self._decision_actions, key=lambda x: x['seq'])
-            ])
+        # Determine final action category
+        # INACTIVE: Set in prenext() via forced_action - strategy warming up
+        # HOLD: No trades executed at this decision point
+        # TRADED: One or more trades executed (details in event_timeline)
+        if 'forced_action' in self._current_decision:
+            action_category = self._current_decision['forced_action']
+        elif any(e['event_type'] == 'TRADE' for e in self._event_timeline):
+            action_category = 'TRADED'
         else:
-            action_summary = 'HOLD'
+            action_category = 'HOLD'
 
         # Get accessed data with field details
         accessed_data = []
         if self.access_tracker:
             accessed_data = self.access_tracker.get_accessed_data()
 
-        # Record the complete decision
-        self._record_decision(action_summary, accessed_data)
+        # Build unified event timeline by merging data accesses and trades
+        event_timeline = self._build_event_timeline(accessed_data)
 
-    def _record_decision(self, action: str, accessed_data: Optional[List] = None):
+        # Record the complete decision
+        self._record_decision(action_category, accessed_data, event_timeline)
+
+    def _build_event_timeline(self, accessed_data: List[Dict]) -> List[Dict]:
+        """
+        Build unified timeline of data accesses and trades in chronological order.
+        This enables replaying the agent's decision process step-by-step.
+        """
+        timeline = []
+
+        # Add data access events from access_tracker
+        for feed_data in accessed_data:
+            symbol = feed_data.get('symbol')
+            data_hash = feed_data.get('data_hash')
+            for access in feed_data.get('access_patterns', []):
+                timeline.append({
+                    'timestamp_ns': access['timestamp_ns'],
+                    'event_type': 'DATA_ACCESS',
+                    'symbol': symbol,
+                    'field': access['field'],
+                    'index': access['index'],
+                    'action': None,  # Not applicable for data access
+                    'size': None,
+                    'price': None,
+                    'value': None,
+                    'commission': None,
+                    'pnl': None,
+                    'data_hash': data_hash
+                })
+
+        # Add trade events (already in _event_timeline from notify_order)
+        timeline.extend(self._event_timeline)
+
+        # Sort by timestamp to get true chronological order
+        timeline.sort(key=lambda x: x['timestamp_ns'])
+
+        # Assign global sequence numbers
+        for seq, event in enumerate(timeline, start=1):
+            event['seq'] = seq
+
+        return timeline
+
+    def _record_decision(self, action: str, accessed_data: Optional[List] = None, event_timeline: Optional[List] = None):
         """Record a decision with all context"""
         if not self._current_decision:
             return
@@ -235,7 +321,7 @@ class FMELAnalyzer(bt.Analyzer):
         # Get current positions
         positions = self._get_positions()
 
-        # Build decision record
+        # Build decision record matching BigQuery schema
         decision = {
             'session_id': self.session_id,
             'agent_id': self.p.agent_id,
@@ -244,12 +330,12 @@ class FMELAnalyzer(bt.Analyzer):
             'bar_time': self._current_decision['bar_time'].isoformat(),
             'stage': self._current_decision['stage'],
             'action': action,
-            'actions': self._decision_actions,  # Detailed action list
             'portfolio_value': float(self.strategy.broker.getvalue()),
             'portfolio_cash': float(self.strategy.broker.getcash()),
             'positions': positions,
             'data_accessed': accessed_data or [],
             'access_count': self.access_tracker.get_access_count() if self.access_tracker else 0,
+            'event_timeline': event_timeline or [],  # Unified timeline for replay (includes trade details)
         }
 
         # Add to batch
@@ -259,7 +345,8 @@ class FMELAnalyzer(bt.Analyzer):
         logger.debug(
             f"Decision {self.decision_count}: {action} - "
             f"Value: ${decision['portfolio_value']:,.2f}, "
-            f"Accessed: {len(decision['data_accessed'])} feeds"
+            f"Accessed: {len(decision['data_accessed'])} feeds, "
+            f"Events: {len(decision['event_timeline'])}"
         )
 
     def _get_positions(self) -> List[Dict]:
@@ -357,6 +444,14 @@ class FMELAnalyzer(bt.Analyzer):
         # Record final decision if pending
         if self._current_decision:
             self._end_decision_point()
+
+        # Log session end (not written to BigQuery - doesn't match decisions schema)
+        logger.info(
+            f"Session ended - "
+            f"Final value: ${self.strategy.broker.getvalue():,.2f}, "
+            f"Final cash: ${self.strategy.broker.getcash():,.2f}, "
+            f"Total decisions: {self.decision_count}"
+        )
 
         # Flush any remaining batches
         with self._batch_lock:

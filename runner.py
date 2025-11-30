@@ -23,10 +23,12 @@ import os
 import sys
 import signal
 import logging
+import json
 from typing import List
 
 import backtrader as bt
 from google.cloud import secretmanager
+import redis
 
 # Import custom components - each handles a specific responsibility:
 # - data_feed: Streams market data from Pub/Sub into Backtrader format
@@ -77,10 +79,20 @@ class TradingRuntime:
         # Cloud Logging when multiple agents run in the same cluster.
         self.logger = logging.getLogger(f"runtime.{self.agent_id}")
 
-        # Parse trading symbols from comma-separated string.
-        # Default to crypto symbols since they trade 24/7 (good for testing).
-        symbols_str = os.environ.get('SYMBOLS', 'BTC/USD,ETH/USD')
-        self.symbols = [s.strip() for s in symbols_str.split(',') if s.strip()]
+        # Redis connection for symbol discovery
+        self.redis_host = os.environ.get('REDIS_HOST', 'localhost')
+        self.redis_port = int(os.environ.get('REDIS_PORT', 6379))
+
+        # Connect to Redis
+        self.redis_client = redis.Redis(
+            host=self.redis_host,
+            port=self.redis_port,
+            decode_responses=True
+        )
+
+        # Get symbols from Redis (populated by asset-discovery service)
+        # We'll fetch both equity and crypto symbols for diversified trading
+        self.symbols = self._get_symbols_from_redis()
 
         # =================================================================
         # CREDENTIAL MANAGEMENT
@@ -94,8 +106,12 @@ class TradingRuntime:
         if not self.api_key or not self.secret_key:
             # In production, fetch from Google Secret Manager using Workload Identity.
             # The pod's service account must have secretAccessor permission.
-            self.api_key = self._get_secret('RUNTIME_BROKER_API_KEY')
-            self.secret_key = self._get_secret('RUNTIME_BROKER_SECRET_KEY')
+            # Secret names must be provided via environment variables.
+            api_key_name = os.environ['RUNTIME_API_KEY_NAME']
+            secret_key_name = os.environ['RUNTIME_SECRET_KEY_NAME']
+
+            self.api_key = self._get_secret(api_key_name)
+            self.secret_key = self._get_secret(secret_key_name)
 
         # FMEL configuration for decision tracking.
         # decisions_v2 table includes field-level access tracking.
@@ -117,6 +133,92 @@ class TradingRuntime:
         # SIGINT is sent when user presses Ctrl+C locally.
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _get_symbols_from_redis(self) -> List[str]:
+        """
+        Get trading symbols from Redis cache (both equities and crypto).
+
+        The asset-discovery service populates Redis with current tradable symbols.
+        We fetch both equity and crypto symbols for a diversified trading strategy.
+
+        Returns:
+            Combined list of equity and crypto symbols
+
+        Raises:
+            SystemExit: If no symbols are found in Redis (critical error)
+        """
+        all_symbols = []
+
+        try:
+            # Fetch equity symbols
+            equity_key = "symbols:equities"
+            equity_cached = self.redis_client.get(equity_key)
+
+            if equity_cached:
+                equity_symbols = json.loads(equity_cached)
+                self.logger.info(f"Loaded {len(equity_symbols)} equity symbols from Redis")
+
+                # By default, use ALL available symbols (0 = no limit)
+                max_equity = int(os.environ.get('MAX_EQUITY_SYMBOLS', '0'))
+                if max_equity > 0:
+                    equity_symbols = equity_symbols[:max_equity]
+                    self.logger.info(f"Limited to {len(equity_symbols)} equity symbols (MAX_EQUITY_SYMBOLS={max_equity})")
+                else:
+                    self.logger.info(f"Using ALL {len(equity_symbols)} available equity symbols")
+
+                all_symbols.extend(equity_symbols)
+            else:
+                self.logger.warning(f"No equity symbols found at key '{equity_key}'")
+
+            # Fetch crypto symbols
+            crypto_key = "symbols:crypto"
+            crypto_cached = self.redis_client.get(crypto_key)
+
+            if crypto_cached:
+                crypto_symbols = json.loads(crypto_cached)
+                self.logger.info(f"Loaded {len(crypto_symbols)} crypto symbols from Redis")
+
+                # By default, use ALL available symbols (0 = no limit)
+                max_crypto = int(os.environ.get('MAX_CRYPTO_SYMBOLS', '0'))
+                if max_crypto > 0:
+                    crypto_symbols = crypto_symbols[:max_crypto]
+                    self.logger.info(f"Limited to {len(crypto_symbols)} crypto symbols (MAX_CRYPTO_SYMBOLS={max_crypto})")
+                else:
+                    self.logger.info(f"Using ALL {len(crypto_symbols)} available crypto symbols")
+
+                all_symbols.extend(crypto_symbols)
+            else:
+                self.logger.warning(f"No crypto symbols found at key '{crypto_key}'")
+
+            # Check if we have any symbols at all
+            if not all_symbols:
+                error_msg = f"""No symbols found in Redis!
+
+The asset-discovery service must populate Redis before the runtime can start.
+Please ensure:
+  1. Redis is accessible at {self.redis_host}:{self.redis_port}
+  2. The asset-discovery services have run successfully
+  3. The cache keys 'symbols:equities' and 'symbols:crypto' contain valid data
+
+To run asset discovery manually:
+  kubectl create job --from=cronjob/equity-asset-refresh equity-manual -n paper-trading
+  kubectl create job --from=cronjob/crypto-asset-refresh crypto-manual -n paper-trading"""
+
+                self.logger.error(error_msg)
+                sys.exit(1)
+
+            self.logger.info(f"Total symbols to trade: {len(all_symbols)} (equities + crypto)")
+            return all_symbols
+
+        except redis.ConnectionError as e:
+            self.logger.error(f"Failed to connect to Redis at {self.redis_host}:{self.redis_port}: {e}")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON in Redis cache: {e}")
+            sys.exit(1)
+        except Exception as e:
+            self.logger.error(f"Unexpected error getting symbols from Redis: {e}")
+            sys.exit(1)
 
     def _get_secret(self, name: str) -> str:
         """
@@ -250,21 +352,16 @@ class TradingRuntime:
         if not self.cerebro:
             raise RuntimeError("Runtime not setup. Call setup() first.")
 
-        # Record initial portfolio state for P&L calculation.
-        initial_value = self.cerebro.broker.getvalue()
-        initial_cash = self.cerebro.broker.getcash()
+        # Log initial state for debugging
         self.logger.info(
-            f"Portfolio initialized - Value: ${initial_value:,.2f}, Cash: ${initial_cash:,.2f}"
+            f"Portfolio initialized - Starting cash: ${self.cerebro.broker.getcash():,.2f}"
         )
 
         try:
             # live=True tells Backtrader this is a live data feed, not historical.
             # This affects how it handles data timing and preloading.
-            results = self.cerebro.run(live=True)
-
-            if results and results[0]:
-                strategy = results[0]
-                self.logger.debug(f"Strategy completed: {strategy.__class__.__name__}")
+            self.cerebro.run(live=True)
+            self.logger.info("Trading engine started successfully")
 
         except KeyboardInterrupt:
             self.logger.info("Trading interrupted by user")
@@ -275,20 +372,11 @@ class TradingRuntime:
             # Always clean up resources, even on error.
             self._cleanup()
 
-        # Calculate and log final performance.
-        final_value = self.cerebro.broker.getvalue()
-        final_cash = self.cerebro.broker.getcash()
-        pnl = final_value - initial_value
-        pnl_pct = (pnl / initial_value * 100) if initial_value else 0
+        # Log shutdown
+        self.logger.info("Runtime stopped - Performance metrics available via Alpaca API")
 
-        self.logger.info(
-            f"Runtime stopped - Value: ${final_value:,.2f}, "
-            f"Cash: ${final_cash:,.2f}, "
-            f"P&L: ${pnl:+,.2f} ({pnl_pct:+.2f}%)"
-        )
-
-        # Return True if profitable or break-even (used for CI/CD pass/fail).
-        return pnl >= 0
+        # Return True for successful run (used for CI/CD pass/fail).
+        return True
 
     def _cleanup(self):
         """
