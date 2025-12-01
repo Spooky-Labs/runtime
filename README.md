@@ -334,8 +334,8 @@ REDIS_HOST=localhost              # Redis server host
 REDIS_PORT=6379                   # Redis server port
 
 # Secret Names (provided by Terraform ConfigMap in production)
-RUNTIME_API_KEY_NAME=runtime-broker-api-key
-RUNTIME_SECRET_KEY_NAME=runtime-broker-secret-key
+RUNTIME_BROKER_API_KEY_NAME=runtime-broker-api-key
+RUNTIME_BROKER_SECRET_KEY_NAME=runtime-broker-secret-key
 ```
 
 #### Optional Variables

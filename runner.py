@@ -107,8 +107,8 @@ class TradingRuntime:
             # In production, fetch from Google Secret Manager using Workload Identity.
             # The pod's service account must have secretAccessor permission.
             # Secret names must be provided via environment variables.
-            api_key_name = os.environ['RUNTIME_API_KEY_NAME']
-            secret_key_name = os.environ['RUNTIME_SECRET_KEY_NAME']
+            api_key_name = os.environ['RUNTIME_BROKER_API_KEY_NAME']
+            secret_key_name = os.environ['RUNTIME_BROKER_SECRET_KEY_NAME']
 
             self.api_key = self._get_secret(api_key_name)
             self.secret_key = self._get_secret(secret_key_name)
