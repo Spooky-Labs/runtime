@@ -1326,12 +1326,11 @@ def main():
         print(f"Error: {target} is not a valid file or directory", file=sys.stderr)
         sys.exit(1)
 
-    # Output results as JSON to stdout (for machine consumption)
-    result = {
-        "models": sorted(models),  # Sort for deterministic output
-        "unresolved": unresolved
-    }
-    print(json.dumps(result, indent=2))
+    # Output cache names to stdout (one per line, for easy use with xargs/gsutil)
+    # Format: models--amazon--chronos-t5-small
+    for model in sorted(models):
+        cache_name = f"models--{model.replace('/', '--')}"
+        print(cache_name)
 
     # Print human-readable summary to stderr
     print(f"\n=== Summary ===", file=sys.stderr)
