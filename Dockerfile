@@ -1,5 +1,9 @@
 FROM gcr.io/the-farm-neutrino-315cd/base-with-models:0.1.5
 
+# Accept models directory from build (populated by detect_models + GCS copy)
+# NOTE: Must be a RELATIVE path (relative to build context) for Docker COPY
+ARG MODELS_DIR=hf_cache/hub
+
 WORKDIR /app
 
 # Install procps for pgrep (needed by Kubernetes health checks)
@@ -13,13 +17,25 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Copy detected models from build context (if any)
+# This directory is populated by the Cloud Build detect-models + copy-models-from-gcs steps
+COPY ${MODELS_DIR}* /tmp/detected_models/
+
 # Create non-root user and copy models to staging location
 # Models will be copied to user's home at runtime (needed for HuggingFace lock files)
+# Priority: detected models (from GCS cache) > base image models
 RUN useradd -m trader && \
     mkdir -p /var/lib/trading-agent && \
-    mkdir -p /opt/models/.cache && \
+    mkdir -p /opt/models/.cache/huggingface/hub && \
     mkdir -p /home/trader/.cache && \
-    cp -r /root/.cache/huggingface /opt/models/.cache/ && \
+    # First copy base image models (fallback)
+    cp -r /root/.cache/huggingface/* /opt/models/.cache/huggingface/ 2>/dev/null || true && \
+    # Then overlay detected models (if any) - these take priority
+    if [ -d /tmp/detected_models ] && [ "$(ls -A /tmp/detected_models 2>/dev/null)" ]; then \
+        echo "Copying detected models from build..."; \
+        cp -r /tmp/detected_models/* /opt/models/.cache/huggingface/hub/ 2>/dev/null || true; \
+    fi && \
+    rm -rf /tmp/detected_models && \
     chown -R trader:trader /app /var/lib/trading-agent /opt/models/.cache/huggingface /home/trader/.cache
 
 # Create entrypoint script to copy models from read-only staging to writable home
