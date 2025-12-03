@@ -252,16 +252,13 @@ class SharedSubscriber:
                 feed = self.feeds.get(symbol)
 
             if feed:
-                # Add to feed's buffer
+                # Add to feed's buffer (deque.append is thread-safe)
+                # NOTE: Do NOT access any other feed attributes here!
+                # Backtrader's internal arrays are not thread-safe and will
+                # cause "array index out of range" errors if accessed from
+                # Pub/Sub's callback thread.
                 feed._data_buffer.append(data)
                 self._messages_routed += 1
-
-                # Update feed state on first message (don't call put_notification
-                # from this thread - Backtrader's internal arrays aren't thread-safe)
-                if hasattr(feed, '_state') and feed._state == feed.DELAYED:
-                    feed._state = feed.LIVE
-                    feed._laststatus = feed.LIVE
-                    logger.info(f"Feed {symbol}: DELAYED → LIVE")
             else:
                 # No feed registered for this symbol
                 self._messages_dropped += 1
