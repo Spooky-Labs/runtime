@@ -116,9 +116,9 @@ class TradingRuntime:
             self.secret_key = self._get_secret(secret_key_name)
 
         # FMEL configuration for decision tracking.
-        # decisions_v2 table includes field-level access tracking.
+        # decisions table stores all trading decisions with field-level access tracking.
         self.fmel_dataset = os.environ.get('FMEL_DATASET', 'fmel')
-        self.fmel_table = os.environ.get('FMEL_TABLE', 'decisions_v2')
+        self.fmel_table = os.environ.get('FMEL_TABLE', 'decisions')
 
         # Allow configurable log verbosity for debugging.
         log_level = os.environ.get('LOG_LEVEL', 'INFO')
