@@ -94,9 +94,15 @@ class SharedSubscriber:
         self.topic_name = topic_name
         self.agent_id = agent_id
 
-        # Registry of feeds by symbol
-        # symbol → PubSubMarketDataFeed instance
+        # Registry of feeds and their buffers by symbol
+        # symbol → PubSubMarketDataFeed instance (for reference only)
         self.feeds: Dict[str, object] = {}
+        # symbol → deque (direct buffer reference for thread-safe callback access)
+        # IMPORTANT: We cache buffer references because accessing ANY attribute on
+        # a Backtrader feed object (even _data_buffer) triggers Backtrader's
+        # __getattribute__ machinery which accesses internal arrays. This causes
+        # "array index out of range" errors when done from Pub/Sub's callback thread.
+        self.buffers: Dict[str, object] = {}
         self._feeds_lock = threading.Lock()
 
         # Pub/Sub components
@@ -125,9 +131,18 @@ class SharedSubscriber:
         Args:
             symbol: The symbol this feed handles (e.g., 'AAPL', 'BTC/USD')
             feed: PubSubMarketDataFeed instance with _data_buffer attribute
+
+        Note:
+            We cache feed._data_buffer at registration time (on main thread)
+            because accessing it from the Pub/Sub callback thread would trigger
+            Backtrader's __getattribute__ and cause "array index out of range"
+            errors. The cached deque reference is safe to use from any thread.
         """
         with self._feeds_lock:
             self.feeds[symbol] = feed
+            # Cache the buffer reference NOW (on main thread) so the callback
+            # thread never accesses any Backtrader object attributes
+            self.buffers[symbol] = feed._data_buffer
             logger.debug(f"Registered feed for {symbol} on {self.topic_name}")
 
             # Start subscription if this is the first feed
@@ -144,7 +159,9 @@ class SharedSubscriber:
         with self._feeds_lock:
             if symbol in self.feeds:
                 del self.feeds[symbol]
-                logger.debug(f"Unregistered feed for {symbol} on {self.topic_name}")
+            if symbol in self.buffers:
+                del self.buffers[symbol]
+            logger.debug(f"Unregistered feed for {symbol} on {self.topic_name}")
 
             # Stop subscription if no more feeds
             if not self.feeds and self._running:
@@ -247,17 +264,17 @@ class SharedSubscriber:
                 self._messages_dropped += 1
                 return
 
-            # Route to registered feed
+            # Route to registered feed's buffer
+            # CRITICAL: We use self.buffers (cached deque references) instead of
+            # accessing feed._data_buffer because any attribute access on a
+            # Backtrader object triggers its __getattribute__ machinery, which
+            # accesses internal arrays that are not thread-safe.
             with self._feeds_lock:
-                feed = self.feeds.get(symbol)
+                buffer = self.buffers.get(symbol)
 
-            if feed:
-                # Add to feed's buffer (deque.append is thread-safe)
-                # NOTE: Do NOT access any other feed attributes here!
-                # Backtrader's internal arrays are not thread-safe and will
-                # cause "array index out of range" errors if accessed from
-                # Pub/Sub's callback thread.
-                feed._data_buffer.append(data)
+            if buffer is not None:
+                # Append directly to the cached deque (thread-safe operation)
+                buffer.append(data)
                 self._messages_routed += 1
             else:
                 # No feed registered for this symbol
@@ -329,6 +346,7 @@ class SharedSubscriber:
             except Exception as e:
                 logger.debug(f"Subscriber close: {e}")
 
-        # Clear feeds
+        # Clear feeds and buffers
         with self._feeds_lock:
             self.feeds.clear()
+            self.buffers.clear()
