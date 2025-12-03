@@ -256,11 +256,11 @@ class SharedSubscriber:
                 feed._data_buffer.append(data)
                 self._messages_routed += 1
 
-                # Trigger feed state transition on first message
+                # Update feed state on first message (don't call put_notification
+                # from this thread - Backtrader's internal arrays aren't thread-safe)
                 if hasattr(feed, '_state') and feed._state == feed.DELAYED:
                     feed._state = feed.LIVE
                     feed._laststatus = feed.LIVE
-                    feed.put_notification(feed.LIVE)
                     logger.info(f"Feed {symbol}: DELAYED → LIVE")
             else:
                 # No feed registered for this symbol
