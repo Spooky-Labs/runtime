@@ -32,11 +32,13 @@ import redis
 
 # Import custom components - each handles a specific responsibility:
 # - data_feed: Streams market data from Pub/Sub into Backtrader format
+# - shared_subscriber: Manages shared Pub/Sub subscriptions (reduces quota usage)
 # - broker: Translates Backtrader orders to Alpaca API calls
 # - agent: Contains the actual trading strategy (replaceable by user code)
 # - fmel_analyzer: Records all decisions to BigQuery for explainability
 # - access_tracker: Tracks which data fields the agent looked at
 from data_feed import PubSubMarketDataFeed
+from shared_subscriber import SharedSubscriber
 from broker import AlpacaPaperTradingBroker
 from agent.agent import Agent
 from fmel_analyzer import FMELAnalyzer
@@ -271,8 +273,12 @@ To run asset discovery manually:
 
         # =====================================================================
         # DATA FEEDS
-        # Create one Pub/Sub subscription per symbol to stream live market data.
+        # All feeds share 2 Pub/Sub subscriptions (one per topic) via SharedSubscriber.
         # Symbol format determines topic: "/" means crypto (24/7), else equity.
+        #
+        # This pattern reduces subscriptions from O(symbols) to O(topics) per agent:
+        # - Old pattern: 70 symbols × 100 agents = 7,000 subscriptions (approaching 10k limit)
+        # - New pattern: 2 topics × 100 agents = 200 subscriptions (supports 5,000 agents)
         # =====================================================================
         data_feeds = []
         for symbol in self.symbols:
@@ -284,6 +290,7 @@ To run asset discovery manually:
                 project_id=self.project_id,
                 topic_name=topic,
                 symbol=symbol,
+                agent_id=self.agent_id,  # Used for subscription naming
                 buffer_size=1000  # Buffer 1000 bars to handle processing delays
             )
 
@@ -384,7 +391,8 @@ To run asset discovery manually:
 
         This is called automatically after run() completes, ensuring:
         - Broker stops monitoring orders (stops background thread)
-        - Data feeds unsubscribe from Pub/Sub (deletes subscriptions)
+        - Data feeds unregister from SharedSubscriber
+        - SharedSubscriber deletes Pub/Sub subscriptions
         - FMEL analyzer flushes remaining decisions to BigQuery
 
         Important: Analyzer stop() is called automatically by Backtrader.
@@ -396,13 +404,21 @@ To run asset discovery manually:
             except Exception as e:
                 self.logger.error(f"Error stopping broker: {e}")
 
-        # Stop data feeds - this deletes Pub/Sub subscriptions to avoid orphans.
+        # Stop data feeds - this unregisters from SharedSubscriber.
         for data in self.cerebro.datas:
             if hasattr(data, 'stop'):
                 try:
                     data.stop()
                 except Exception as e:
                     self.logger.error(f"Error stopping feed {data._name}: {e}")
+
+        # Clean up SharedSubscriber instances - this deletes the Pub/Sub subscriptions.
+        # This prevents orphaned subscriptions when the pod terminates.
+        try:
+            SharedSubscriber.cleanup_all()
+            self.logger.info("SharedSubscriber cleanup complete")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up SharedSubscriber: {e}")
 
         # Note: Analyzer.stop() is called automatically by Backtrader's run().
         # This triggers FMEL to flush any remaining batched decisions.

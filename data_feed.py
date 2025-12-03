@@ -7,23 +7,22 @@ engine for the agent to make decisions on.
 
 Data Flow:
     1. Data Ingestor publishes OHLCV bars to Pub/Sub topics
-    2. This feed creates a filtered subscription for its symbol
-    3. Messages are buffered in a lock-free deque
-    4. Backtrader pulls from buffer bar-by-bar
+    2. SharedSubscriber manages ONE subscription per topic (not per symbol!)
+    3. SharedSubscriber routes messages to the correct feed by symbol
+    4. Messages are buffered in a lock-free deque
+    5. Backtrader pulls from buffer bar-by-bar
 
-Why Pub/Sub:
-- Decouples data ingestion from trading agents
-- Multiple agents can consume the same data stream
-- Automatic message retention and replay capability
-- Scales to thousands of symbols
+Why SharedSubscriber Pattern:
+- Pub/Sub has 10,000 subscription limit per topic/project
+- Old pattern: 70 subscriptions per agent → limit reached at 140 agents
+- New pattern: 2 subscriptions per agent → supports 5,000 agents
 
 Key Design Decisions:
 1. **Lock-Free Buffering**: Using deque with maxlen for efficient, thread-safe
    buffering without explicit locks.
 
-2. **Filtered Subscriptions**: Each feed creates its own subscription with a
-   filter for its specific symbol. This prevents agents from receiving data
-   for symbols they don't trade.
+2. **Shared Subscriptions**: All feeds for the same topic share ONE subscription
+   via SharedSubscriber. Messages are routed by symbol to correct feed buffer.
 
 3. **Content-Addressed Hashing**: Each data point includes a hash from the
    ingestor, enabling FMEL to correlate decisions with exact data versions.
@@ -34,7 +33,8 @@ import json
 import logging
 from collections import deque
 from datetime import datetime, timezone
-from google.cloud import pubsub_v1
+
+from shared_subscriber import SharedSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
         ('project_id', None),  # GCP project ID
         ('topic_name', None),  # Pub/Sub topic (crypto-data or market-data)
         ('symbol', None),  # Symbol to subscribe to (e.g., BTC/USD)
+        ('agent_id', None),  # Agent ID for subscription naming (Firebase agent ID)
         ('buffer_size', 1000),  # Max messages to buffer before dropping old ones
     )
 
@@ -81,21 +82,17 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
 
         # Lock-free buffer for incoming messages.
         # Using maxlen automatically discards oldest messages if we fall behind.
+        # Note: SharedSubscriber routes messages directly into this buffer.
         self._data_buffer = deque(maxlen=self.p.buffer_size)
 
-        # =================================================================
-        # PUB/SUB COMPONENTS
-        # =================================================================
-        self._subscriber = None  # SubscriberClient instance
-        self._subscription = None  # Active subscription future
-        self._subscription_path = None  # Full path to subscription resource
+        # Reference to the shared subscriber (set in start())
+        self._shared_subscriber = None
 
         # Hash of current data point - used by FMEL for traceability.
         # This lets us correlate decisions with exact data versions.
         self.current_data_hash = None
 
         # Monitoring stats
-        self._messages_received = 0
         self._messages_processed = 0
 
         logger.info(f"Data feed initialized for {self.p.symbol}")
@@ -110,99 +107,37 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
 
     def start(self):
         """
-        Start the data feed by creating a Pub/Sub subscription.
+        Start the data feed by registering with the SharedSubscriber.
 
-        This creates a unique subscription filtered by symbol, ensuring we only
-        receive data for the symbol we're trading. The subscription is deleted
-        on stop() to avoid orphaned resources.
+        The SharedSubscriber manages ONE subscription per topic, shared across
+        all feeds. This dramatically reduces subscription count from O(symbols)
+        to O(topics) per agent.
 
         Flow:
-        1. Create SubscriberClient
-        2. Build unique subscription name (includes object ID to avoid collisions)
-        3. Create subscription with symbol filter
-        4. Start async message pulling
+        1. Get SharedSubscriber singleton for this topic
+        2. Register this feed to receive messages for our symbol
+        3. SharedSubscriber routes messages to our _data_buffer
         """
         if self._running:
             return
 
         try:
-            self._subscriber = pubsub_v1.SubscriberClient()
-
-            # Build unique subscription name.
-            # Format: feed-BTC-USD-7f8a3b (symbol + object ID hex)
-            topic_path = f"projects/{self.p.project_id}/topics/{self.p.topic_name}"
-            subscription_id = f"feed-{self.p.symbol.replace('/', '-')}-{id(self):x}"
-            self._subscription_path = f"projects/{self.p.project_id}/subscriptions/{subscription_id}"
-
-            # Create subscription with filter for this symbol only.
-            self._create_subscription(topic_path)
-
-            # Start async message pulling with flow control.
-            flow_control = pubsub_v1.types.FlowControl(max_messages=self.p.buffer_size)
-            self._subscription = self._subscriber.subscribe(
-                self._subscription_path,
-                callback=self._handle_message,
-                flow_control=flow_control
+            # Get or create the shared subscriber for this topic
+            self._shared_subscriber = SharedSubscriber.get_instance(
+                self.p.project_id,
+                self.p.topic_name,
+                self.p.agent_id
             )
 
+            # Register this feed to receive messages for our symbol
+            self._shared_subscriber.register_feed(self.p.symbol, self)
+
             self._running = True
-            logger.info(f"Feed started for {self.p.symbol} [{subscription_id}]")
+            logger.info(f"Feed started for {self.p.symbol} (shared subscription)")
 
         except Exception as e:
             logger.error(f"Failed to start feed for {self.p.symbol}: {e}")
             raise
-
-    def _create_subscription(self, topic_path: str):
-        """Create subscription with idempotent retry"""
-        try:
-            # Try to delete existing subscription
-            self._subscriber.delete_subscription(
-                request={"subscription": self._subscription_path}
-            )
-        except Exception:
-            pass  # Subscription didn't exist
-
-        # Create new subscription with filter
-        self._subscriber.create_subscription(
-            request={
-                "name": self._subscription_path,
-                "topic": topic_path,
-                "filter": f'attributes.symbol = "{self.p.symbol}"',
-                "ack_deadline_seconds": 20,
-                "enable_message_ordering": True if "/" not in self.p.symbol else False,
-            }
-        )
-
-    def _handle_message(self, message: pubsub_v1.subscriber.message.Message):
-        """Efficiently handle incoming messages"""
-        try:
-            # Parse message
-            data = json.loads(message.data.decode('utf-8'))
-
-            # Add to buffer
-            self._data_buffer.append(data)
-            self._messages_received += 1
-
-            # Transition to LIVE on first message
-            if self._state == self.DELAYED:
-                self._state = self.LIVE
-                self._laststatus = self.LIVE  # Update Backtrader status tracking
-                self.put_notification(self.LIVE)
-                logger.info(f"Feed {self.p.symbol}: DELAYED → LIVE")
-
-            # Acknowledge immediately
-            message.ack()
-
-            # Log periodically
-            if self._messages_received % 100 == 0:
-                logger.debug(f"Feed {self.p.symbol}: {self._messages_received} messages received")
-
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in message: {e}")
-            message.nack()
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            message.nack()
 
     def _load(self):
         """Load next data point with minimal latency"""
@@ -258,34 +193,18 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
         self._state = self.DISCONNECTED
         self._laststatus = self.DISCONNECTED
 
-        # Cancel subscription
-        if self._subscription:
+        # Unregister from shared subscriber
+        # Note: SharedSubscriber.stop() is called by runner.py cleanup,
+        # which deletes the actual subscription.
+        if self._shared_subscriber:
             try:
-                self._subscription.cancel()
-                self._subscription.result(timeout=5)  # Wait for cancellation
+                self._shared_subscriber.unregister_feed(self.p.symbol)
             except Exception as e:
-                logger.debug(f"Subscription cancellation: {e}")
-
-        # Delete subscription
-        if self._subscriber and self._subscription_path:
-            try:
-                self._subscriber.delete_subscription(
-                    request={"subscription": self._subscription_path}
-                )
-            except Exception as e:
-                logger.debug(f"Subscription deletion: {e}")
-
-        # Close subscriber
-        if self._subscriber:
-            try:
-                self._subscriber.close()
-            except Exception as e:
-                logger.debug(f"Subscriber close: {e}")
+                logger.debug(f"Feed unregistration: {e}")
 
         # Log final stats
         logger.info(
             f"Feed {self.p.symbol} stopped - "
-            f"Received: {self._messages_received}, "
             f"Processed: {self._messages_processed}, "
             f"Buffered: {len(self._data_buffer)}"
         )
