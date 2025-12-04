@@ -32,7 +32,8 @@ import queue
 from collections import defaultdict
 from typing import Dict, Any
 from alpaca.broker.client import BrokerClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.broker.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 
 logger = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ class AlpacaPaperTradingBroker(bt.BrokerBase):
             # Get all open orders from Alpaca
             open_orders = self.client.get_orders_for_account(
                 account_id=self.p.account_id,
-                filter={'status': 'open'}
+                filter=GetOrdersRequest(status='open')
             )
 
             # Create set of open order IDs
@@ -165,7 +166,7 @@ class AlpacaPaperTradingBroker(bt.BrokerBase):
                 if alpaca_id not in open_ids:
                     # Order is no longer open, get final status
                     try:
-                        alpaca_order = self.client.get_order_for_account(
+                        alpaca_order = self.client.get_order_for_account_by_id(
                             account_id=self.p.account_id,
                             order_id=alpaca_id
                         )
@@ -330,7 +331,7 @@ class AlpacaPaperTradingBroker(bt.BrokerBase):
 
         try:
             info = self._orders[order.ref]
-            self.client.cancel_order_for_account(
+            self.client.cancel_order_for_account_by_id(
                 account_id=self.p.account_id,
                 order_id=info['alpaca_id']
             )
