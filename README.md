@@ -19,7 +19,7 @@ flowchart TB
         PubSub[Google Pub/Sub<br/>Market Data Topics]
         Alpaca[Alpaca API<br/>Paper Trading]
         BigQuery[BigQuery<br/>FMEL Storage]
-        Ingestor[Crypto Data Ingestor<br/>Market Data Publisher]
+        Ingestor[Data Ingestors<br/>Market Data Publisher]
     end
 
     subgraph core["Runtime Core"]
@@ -28,7 +28,8 @@ flowchart TB
     end
 
     subgraph data["Data Layer"]
-        DataFeed[PubSubMarketDataFeed<br/>Real-time Data]
+        SharedSub[SharedSubscriber<br/>1 sub per topic]
+        DataFeed[PubSubMarketDataFeed<br/>Per-symbol buffers]
         Broker[AlpacaPaperTradingBroker<br/>Order Management]
         FMEL[FMELAnalyzer<br/>Decision & Access Tracking]
     end
@@ -39,7 +40,8 @@ flowchart TB
     end
 
     Ingestor -->|Publishes| PubSub
-    PubSub -->|Subscribes| DataFeed
+    PubSub -->|2 subs per agent| SharedSub
+    SharedSub -->|Routes by symbol| DataFeed
     DataFeed -->|Market Data| BT
 
     BT -->|Strategy Calls| Agent
@@ -90,34 +92,79 @@ def _monitor_orders(self):
 4. State changes queued for Backtrader
 5. Portfolio refreshed on fills
 
-### 2. PubSubMarketDataFeed (`data_feed.py`)
+### 2. SharedSubscriber (`shared_subscriber.py`)
+
+**Purpose**: Manages shared Pub/Sub subscriptions to reduce quota usage from O(symbols × agents) to O(topics × agents).
+
+**Why This Pattern Exists**:
+- Pub/Sub has a hard limit of **10,000 subscriptions per topic per project**
+- Old pattern: 70 subscriptions per agent (one per symbol)
+- New pattern: 2 subscriptions per agent (one per topic: market-data + crypto-data)
+- Result: Supports **5,000 agents** instead of ~140
+
+**Key Features**:
+- **Singleton Per Topic**: One SharedSubscriber instance per (project, topic, agent_id)
+- **Symbol Routing**: Routes messages to correct feed buffers based on `symbol` field
+- **Thread-Safe Buffering**: Caches deque references to avoid Backtrader's `__getattribute__`
+- **Auto Cleanup**: Deletes subscriptions on graceful shutdown (prevents orphans)
+
+**Architecture**:
+```python
+# Registration (on main thread) - cache buffer reference
+def register_feed(self, symbol: str, feed: object):
+    with self._feeds_lock:
+        self.feeds[symbol] = feed
+        self.buffers[symbol] = feed._data_buffer  # Cache deque NOW
+
+# Message handling (on Pub/Sub thread) - no Backtrader access
+def _handle_message(self, message):
+    data = json.loads(message.data.decode('utf-8'))
+    symbol = data.get('symbol')
+
+    with self._feeds_lock:
+        buffer = self.buffers.get(symbol)  # Get cached deque
+
+    if buffer is not None:
+        buffer.append(data)  # Direct deque append (thread-safe)
+
+    message.ack()
+```
+
+**Subscription Naming**:
+```
+agent-{agent_id}-{topic_name}
+Examples:
+  agent-a1b2c3d4-market-data
+  agent-a1b2c3d4-crypto-data
+```
+
+**Thread Safety Critical Detail**:
+Backtrader's `__getattribute__` accesses internal arrays for ANY attribute access on feed objects. Even accessing `feed._data_buffer` from a background thread triggers this machinery and causes "array index out of range" errors. The solution is to cache the `collections.deque` reference at registration time (on the main thread) so the callback thread only accesses the cached deque directly.
+
+### 3. PubSubMarketDataFeed (`data_feed.py`)
 
 **Purpose**: Streams real-time market data from Google Pub/Sub to Backtrader with support for dynamic fields.
 
 **Key Features**:
 - **Lock-Free Buffering**: Deque with maxlen for efficient data queuing
-- **Auto Subscription Management**: Creates filtered subscriptions per symbol
+- **SharedSubscriber Integration**: Registers with SharedSubscriber instead of creating per-symbol subscriptions
 - **State Transitions**: DELAYED → LIVE → DISCONNECTED lifecycle
 - **Content-Addressed Hashing**: Provides data_hash for FMEL tracking
 - **Dynamic Fields**: Automatically discovers and exposes news, sentiment, and custom data
 
 **Architecture**:
 ```python
-# Efficient message handling
-def _handle_message(self, message):
-    data = json.loads(message.data.decode('utf-8'))
-    self._data_buffer.append(data)  # Lock-free append
-
-    if self._state == self.DELAYED:
-        self._state = self.LIVE
-        self.put_notification(self.LIVE)
-
-    message.ack()  # Immediate acknowledgment
+# Feed registers with SharedSubscriber
+def start(self):
+    subscriber = SharedSubscriber.get_instance(
+        self.project_id, self.topic_name, self.agent_id
+    )
+    subscriber.register_feed(self.symbol, self)
 ```
 
 **Data Flow**:
-1. Pub/Sub subscription with symbol filter
-2. Async message callback fills buffer
+1. Feed registers with SharedSubscriber by symbol
+2. SharedSubscriber routes messages to feed's buffer
 3. `_load()` pops FIFO from buffer
 4. Converts to OHLCV for Backtrader
 5. Dynamically creates lines for additional fields
@@ -181,7 +228,7 @@ class Agent(bt.Strategy):
             # Make trading decisions based on all available data
 ```
 
-### 3. FMELAnalyzer (`fmel_analyzer.py`)
+### 4. FMELAnalyzer (`fmel_analyzer.py`)
 
 **Purpose**: Memory-efficient tracking of trading decisions with field-level data access for complete explainability.
 
@@ -275,7 +322,7 @@ class FMELAnalyzer(bt.Analyzer):
 }
 ```
 
-### 4. Access Tracker (`access_tracker.py`)
+### 5. Access Tracker (`access_tracker.py`)
 
 **Purpose**: Provides field-level tracking of data access for complete explainability.
 
@@ -347,7 +394,7 @@ MAX_CRYPTO_SYMBOLS=0              # Default: 0 (all crypto)
 
 # FMEL Configuration
 FMEL_DATASET=fmel                 # Default: fmel
-FMEL_TABLE=decisions_v2           # Default: decisions_v2 (with field tracking)
+FMEL_TABLE=decisions              # Default: decisions
 
 # Logging
 LOG_LEVEL=INFO                    # Default: INFO
@@ -471,7 +518,7 @@ kubectl logs -l app=trading-agent -f
 
 ### 1. Market Data Pipeline
 ```
-Crypto Exchange → Ingestor → Pub/Sub → Subscription → DataFeed → Backtrader
+Exchange → Ingestor → Pub/Sub Topic → SharedSubscriber (2 subs/agent) → Routes by symbol → DataFeed Buffers → Backtrader
 ```
 
 ### 2. Trading Decision Pipeline
@@ -489,8 +536,9 @@ Agent Decision + Market Hash + Portfolio State → FMEL → Batch → BigQuery
 ### Graceful Shutdown
 - Signal handlers for SIGINT/SIGTERM
 - Broker thread cleanup
-- Data feed subscription deletion
-- FMEL batch flush
+- Data feed unregistration from SharedSubscriber
+- SharedSubscriber deletes Pub/Sub subscriptions (prevents orphans)
+- FMEL batch flush to BigQuery
 - Final portfolio reporting
 
 ### Error Recovery
@@ -534,7 +582,7 @@ SELECT
   action,
   portfolio_value,
   ARRAY_LENGTH(positions) as position_count
-FROM `project.fmel.decisions_v2`
+FROM `project.fmel.decisions`
 WHERE session_id = 'agent_123_1699564800'
 ORDER BY timestamp DESC
 LIMIT 100;
@@ -544,7 +592,7 @@ SELECT
   action,
   COUNT(*) as count,
   AVG(portfolio_value) as avg_value
-FROM `project.fmel.decisions_v2`
+FROM `project.fmel.decisions`
 GROUP BY action;
 ```
 
@@ -577,10 +625,16 @@ GROUP BY action;
 - Ensure using paper trading sandbox endpoints
 
 **FMEL Not Recording**:
-- Verify BigQuery dataset/table exists
+- Verify BigQuery dataset/table exists (`fmel.decisions`)
 - Check service account permissions
 - Review batch timer logs
-- Ensure decisions_v2 table schema includes field tracking
+- Common error: 404 on BigQuery means table name mismatch (use `decisions` not `decisions_v2`)
+
+**SharedSubscriber Errors**:
+- "array index out of range" = Backtrader attribute accessed from callback thread
+  - Fix: Ensure buffer references are cached at registration time, not in callback
+- Subscription quota exhausted = Too many orphaned subscriptions
+  - Clean up: `gcloud pubsub subscriptions list | grep 'feed-' | xargs -P 20 -I {} gcloud pubsub subscriptions delete {}`
 
 **Library Compatibility**:
 - Match exact versions from backtesting container

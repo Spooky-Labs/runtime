@@ -104,7 +104,7 @@ class FMELAnalyzer(bt.Analyzer):
 
         # Temporary storage for the decision currently being recorded
         # Contains bar_time, stage, portfolio state at decision start
-        # Set in _start_decision_point(), consumed in _end_decision_point()
+        # Set in prenext/nextstart/next(), consumed in _end_decision_point()
         self._current_decision = None
 
         # Collects TRADE events during a single decision point
@@ -176,27 +176,51 @@ class FMELAnalyzer(bt.Analyzer):
         )
 
     def prenext(self):
-        """Called before minimum period for all datas/indicators"""
-        self._start_decision_point('PRENEXT')
-        # Force INACTIVE action - strategy is warming up, can't trade yet
-        self._current_decision['forced_action'] = 'INACTIVE'
+        """Called after Strategy.prenext() completes.
+
+        Strategy may have used prenext() -> self.next() pattern for multi-feed trading.
+        Don't reset tracker/timeline BEFORE recording - capture what the strategy actually did.
+        """
+        self.decision_count += 1
+        self._current_decision = {
+            'decision_point': self.decision_count,
+            'stage': 'PRENEXT',
+            'bar_time': bt.num2date(self.strategy.datetime[0]),
+        }
+        # No forced_action - _end_decision_point will determine based on actual activity
         self._end_decision_point()
+        # Reset for next bar (AFTER recording)
+        if self.access_tracker:
+            self.access_tracker.reset()
+        self._event_timeline = []
 
     def nextstart(self):
-        """Called exactly once when minimum period is reached"""
-        self._start_decision_point('NEXTSTART')
-        # No forced action - will be HOLD or TRADED based on actual trades
+        """Called after Strategy.nextstart() completes."""
+        self.decision_count += 1
+        self._current_decision = {
+            'decision_point': self.decision_count,
+            'stage': 'NEXTSTART',
+            'bar_time': bt.num2date(self.strategy.datetime[0]),
+        }
         self._end_decision_point()
+        # Reset for next bar
+        if self.access_tracker:
+            self.access_tracker.reset()
+        self._event_timeline = []
 
     def next(self):
-        """Called for each bar after minimum period"""
-        # End previous decision point if exists
-        if self._current_decision and self._current_decision['stage'] == 'NEXT':
-            self._end_decision_point()
-
-        # Start new decision point
-        self._start_decision_point('NEXT')
-        # Strategy has already run at this point (Analyzer.next() is called after Strategy.next())
+        """Called after Strategy.next() completes."""
+        self.decision_count += 1
+        self._current_decision = {
+            'decision_point': self.decision_count,
+            'stage': 'NEXT',
+            'bar_time': bt.num2date(self.strategy.datetime[0]),
+        }
+        self._end_decision_point()
+        # Reset for next bar
+        if self.access_tracker:
+            self.access_tracker.reset()
+        self._event_timeline = []
 
     def notify_order(self, order):
         """
@@ -229,44 +253,26 @@ class FMELAnalyzer(bt.Analyzer):
                 f"Size: {order.executed.size} @ {order.executed.price}"
             )
 
-    def _start_decision_point(self, stage: str):
-        """Start tracking a new decision point"""
-        self.decision_count += 1
-
-        # Reset access tracker for new decision
-        if self.access_tracker:
-            self.access_tracker.reset()
-
-        # Initialize decision structure
-        self._current_decision = {
-            'decision_point': self.decision_count,
-            'stage': stage,
-            'bar_time': bt.num2date(self.strategy.datetime[0]),
-        }
-
-        # Reset event timeline for new decision
-        self._event_timeline = []
-
     def _end_decision_point(self):
         """Finalize and record the decision point"""
         if not self._current_decision:
             return
 
-        # Determine final action category
-        # INACTIVE: Set in prenext() via forced_action - strategy warming up
-        # HOLD: No trades executed at this decision point
-        # TRADED: One or more trades executed (details in event_timeline)
-        if 'forced_action' in self._current_decision:
-            action_category = self._current_decision['forced_action']
-        elif any(e['event_type'] == 'TRADE' for e in self._event_timeline):
-            action_category = 'TRADED'
-        else:
-            action_category = 'HOLD'
-
-        # Get accessed data with field details
+        # Get accessed data with field details (needed for action category determination)
         accessed_data = []
         if self.access_tracker:
             accessed_data = self.access_tracker.get_accessed_data()
+
+        # Determine final action category based on what the strategy ACTUALLY did:
+        # TRADED: One or more trades executed
+        # HOLD: Strategy accessed data but didn't trade (made conscious decision)
+        # INACTIVE: No data accessed, no trades (true warmup - strategy couldn't act)
+        if any(e['event_type'] == 'TRADE' for e in self._event_timeline):
+            action_category = 'TRADED'
+        elif accessed_data:
+            action_category = 'HOLD'
+        else:
+            action_category = 'INACTIVE'
 
         # Build unified event timeline by merging data accesses and trades
         event_timeline = self._build_event_timeline(accessed_data)
