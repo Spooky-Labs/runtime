@@ -332,7 +332,7 @@ To run asset discovery manually:
             project_id=self.project_id,
             dataset_id=self.fmel_dataset,
             table_id=self.fmel_table,
-            batch_size=10,  # Write to BigQuery every 10 decisions
+            batch_size=1,  # Write immediately - prevents 413 errors with many data feeds
             batch_timeout=5.0,  # Or every 5 seconds, whichever comes first
             access_tracker=access_tracker,
             data_feeds=data_feeds  # Analyzer wraps feeds to track access
