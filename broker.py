@@ -185,8 +185,8 @@ class AlpacaPaperTradingBroker(bt.BrokerBase):
             # Update Backtrader order
             getattr(bt_order, method)()
 
-            # Queue notification
-            self._notifications.put((bt_order, alpaca_order.status))
+            # Queue notification - Backtrader expects just the order, not a tuple
+            self._notifications.put(bt_order)
 
             # Remove from tracking if terminal state
             if alpaca_order.status in {OrderStatus.FILLED, OrderStatus.CANCELED,
