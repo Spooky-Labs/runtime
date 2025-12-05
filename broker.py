@@ -202,25 +202,32 @@ class AlpacaPaperTradingBroker(bt.BrokerBase):
                           f"[{alpaca_order.id[:8]}]")
 
     def refresh_account(self):
-        """Efficiently refresh account state"""
-        try:
-            # Get account and positions in one batch
-            account = self.client.get_trade_account_by_id(account_id=self.p.account_id)
-            self._cash = float(account.cash)
-            self._value = float(account.equity)
+        """Refresh account state with retry for inactive accounts"""
+        import time
+        for attempt in range(5):
+            try:
+                account = self.client.get_trade_account_by_id(account_id=self.p.account_id)
+                self._cash = float(account.cash)
+                self._value = float(account.equity)
 
-            # Update positions
-            positions = self.client.get_all_positions_for_account(account_id=self.p.account_id)
-            self._positions.clear()
-            for p in positions:
-                self._positions[p.symbol] = {
-                    'size': float(p.qty),
-                    'price': float(p.avg_entry_price)
-                }
-            return True
-        except Exception as e:
-            logger.error(f"Account refresh failed: {e}")
-            return False
+                # Update positions
+                positions = self.client.get_all_positions_for_account(account_id=self.p.account_id)
+                self._positions.clear()
+                for p in positions:
+                    self._positions[p.symbol] = {
+                        'size': float(p.qty),
+                        'price': float(p.avg_entry_price)
+                    }
+
+                # Success if we have funds, or if this isn't the first attempt
+                if self._cash > 0 or self._value > 0 or attempt > 0:
+                    return True
+                logger.warning(f"Account has $0 balance, retrying ({attempt + 1}/5)...")
+            except Exception as e:
+                logger.warning(f"Account refresh attempt {attempt + 1}/5 failed: {e}")
+            time.sleep(5)
+        logger.error("Account refresh failed after 5 attempts")
+        return False
 
     def getcash(self) -> float:
         """Get available cash"""
