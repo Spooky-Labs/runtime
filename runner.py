@@ -76,6 +76,7 @@ class TradingRuntime:
         self.project_id = os.environ['GOOGLE_CLOUD_PROJECT']
         self.agent_id = os.environ['AGENT_ID']
         self.account_id = os.environ['ALPACA_ACCOUNT_ID']
+        self.user_id = os.environ.get('USER_ID')  # Firebase user ID for Firestore security
 
         # Create agent-specific logger to allow filtering logs by agent in
         # Cloud Logging when multiple agents run in the same cluster.
@@ -329,9 +330,11 @@ To run asset discovery manually:
         self.cerebro.addanalyzer(
             FMELAnalyzer,
             agent_id=self.agent_id,
+            user_id=self.user_id,  # For Firestore security rules
             project_id=self.project_id,
             dataset_id=self.fmel_dataset,
             table_id=self.fmel_table,
+            pubsub_topic='fmel-decisions',  # Real-time streaming to Firestore
             batch_size=1,  # Write immediately - prevents 413 errors with many data feeds
             batch_timeout=5.0,  # Or every 5 seconds, whichever comes first
             access_tracker=access_tracker,

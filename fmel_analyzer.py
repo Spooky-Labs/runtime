@@ -33,12 +33,14 @@ and trades that map directly to BigQuery's schema (see bigquery_schema.json).
 """
 
 import backtrader as bt
+import json
 import logging
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 from google.cloud import bigquery
+from google.cloud import pubsub_v1
 from google.api_core import retry
 
 from access_tracker import AccessTracker, AccessTrackingWrapper
@@ -62,7 +64,11 @@ class FMELAnalyzer(bt.Analyzer):
         # Used to filter decisions by agent in BigQuery queries
         ('agent_id', None),
 
-        # Google Cloud project ID for BigQuery writes
+        # Firebase user ID for security rules in Firestore
+        # Enables filtering decisions by user on the frontend
+        ('user_id', None),
+
+        # Google Cloud project ID for BigQuery and Pub/Sub
         ('project_id', None),
 
         # BigQuery dataset name - always 'fmel' for Foundation Model Explainability Layer
@@ -70,6 +76,10 @@ class FMELAnalyzer(bt.Analyzer):
 
         # BigQuery table name - always 'decisions' (matches Infrastructure/bigquery.tf schema)
         ('table_id', 'decisions'),
+
+        # Pub/Sub topic for real-time decision streaming (e.g., "fmel-decisions")
+        # If None, Pub/Sub publishing is disabled (BigQuery-only mode)
+        ('pubsub_topic', None),
 
         # Number of decisions to buffer before flushing to BigQuery
         # Higher values reduce API calls but increase memory usage and data loss risk
@@ -137,12 +147,24 @@ class FMELAnalyzer(bt.Analyzer):
         # Shared with AccessTrackingWrapper instances that wrap data feeds
         self.access_tracker = self.p.access_tracker
 
+        # =====================================================================
+        # PUB/SUB PUBLISHER
+        # For real-time streaming to Firestore via Cloud Function.
+        # Initialized in start() if pubsub_topic is set.
+        # =====================================================================
+        self.pubsub_publisher = None
+        self.pubsub_topic_path = None
+
         logger.info(f"FMEL Analyzer initialized - Session: {self.session_id}")
 
     def start(self):
         """Called when analyzer starts"""
         # Initialize BigQuery
         self._setup_bigquery()
+
+        # Initialize Pub/Sub for real-time streaming (if configured)
+        if self.p.pubsub_topic:
+            self._setup_pubsub()
 
         # Wrap the strategy's data feeds to track access
         # Note: We wrap here instead of in runner.py to avoid timing issues with
@@ -344,8 +366,12 @@ class FMELAnalyzer(bt.Analyzer):
             'event_timeline': event_timeline or [],  # Unified timeline for replay (includes trade details)
         }
 
-        # Add to batch
+        # Add to batch (BigQuery)
         self._add_to_batch(decision)
+
+        # Publish to Pub/Sub for real-time streaming (if configured)
+        if self.pubsub_publisher:
+            self._publish_to_pubsub(decision)
 
         # Log decision
         logger.debug(
@@ -388,6 +414,84 @@ class FMELAnalyzer(bt.Analyzer):
         except Exception as e:
             logger.error(f"Failed to setup BigQuery: {e}")
             raise
+
+    def _setup_pubsub(self):
+        """Initialize Pub/Sub publisher for real-time streaming"""
+        try:
+            self.pubsub_publisher = pubsub_v1.PublisherClient()
+            self.pubsub_topic_path = self.pubsub_publisher.topic_path(
+                self.p.project_id,
+                self.p.pubsub_topic
+            )
+            logger.info(f"Pub/Sub publisher initialized - Topic: {self.p.pubsub_topic}")
+        except Exception as e:
+            logger.error(f"Failed to setup Pub/Sub: {e}")
+            # Don't raise - Pub/Sub is optional, BigQuery is primary
+            self.pubsub_publisher = None
+            self.pubsub_topic_path = None
+
+    def _publish_to_pubsub(self, decision: Dict):
+        """
+        Publish decision to Pub/Sub for real-time streaming.
+
+        The message format is optimized for Firestore:
+        - Includes user_id for security rules
+        - Flattens nested data for efficient queries
+        - Strips data_accessed (too large, not needed for real-time view)
+        """
+        if not self.pubsub_publisher:
+            return
+
+        try:
+            # Build optimized message for Firestore (smaller than BigQuery record)
+            message = {
+                'session_id': decision['session_id'],
+                'agent_id': decision['agent_id'],
+                'user_id': self.p.user_id,  # Required for Firestore security rules
+                'decision_point': decision['decision_point'],
+                'timestamp': decision['timestamp'],
+                'bar_time': decision['bar_time'],
+                'stage': decision['stage'],
+                'action': decision['action'],
+                'portfolio_value': decision['portfolio_value'],
+                'portfolio_cash': decision['portfolio_cash'],
+                'access_count': decision['access_count'],
+                'positions': decision['positions'],
+                # Include full event timeline (trades + data access patterns)
+                'event_timeline': [
+                    {
+                        'seq': e.get('seq', 0),
+                        'event_type': e['event_type'],
+                        'symbol': e.get('symbol'),
+                        'field': e.get('field'),
+                        'index': e.get('index'),
+                        'action': e.get('action'),
+                        'size': e.get('size'),
+                        'price': e.get('price'),
+                    }
+                    for e in decision.get('event_timeline', [])
+                ]
+            }
+
+            # Serialize and publish
+            data = json.dumps(message).encode('utf-8')
+            future = self.pubsub_publisher.publish(self.pubsub_topic_path, data)
+
+            # Fire and forget - don't block on publish result
+            # Errors will be logged by the publisher's error callback
+            future.add_done_callback(self._pubsub_callback)
+
+        except Exception as e:
+            logger.warning(f"Failed to publish to Pub/Sub: {e}")
+            # Don't raise - Pub/Sub failure shouldn't stop BigQuery writes
+
+    def _pubsub_callback(self, future):
+        """Callback for Pub/Sub publish result"""
+        try:
+            # This will raise if publish failed
+            future.result()
+        except Exception as e:
+            logger.warning(f"Pub/Sub publish failed: {e}")
 
     def _add_to_batch(self, decision: Dict):
         """Add decision to batch with automatic flushing"""
