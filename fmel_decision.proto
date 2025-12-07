@@ -1,0 +1,59 @@
+// FMEL Decision schema for BigQuery Storage Write API
+// Use proto2 syntax (proto3 has compatibility issues with BigQuery)
+// All fields optional (even REQUIRED ones in BQ schema)
+// No package directive (causes issues with nested types)
+
+syntax = "proto2";
+
+message AccessPattern {
+  optional int64 seq = 1;
+  optional int64 timestamp_ns = 2;
+  optional string field = 3;
+  optional int64 index = 4;
+}
+
+message DataAccessed {
+  optional string symbol = 1;
+  optional string data_hash = 2;
+  repeated string fields_accessed = 3;
+  repeated AccessPattern access_patterns = 4;
+}
+
+message EventTimelineEntry {
+  optional int64 seq = 1;
+  optional int64 timestamp_ns = 2;
+  optional string event_type = 3;
+  optional string symbol = 4;
+  optional string field = 5;
+  optional int64 index = 6;
+  optional string action = 7;
+  optional double size = 8;
+  optional double price = 9;
+  optional double value = 10;
+  optional double commission = 11;
+  optional double pnl = 12;
+  optional string data_hash = 13;
+}
+
+message Position {
+  optional string symbol = 1;
+  optional double size = 2;
+  optional double price = 3;
+  optional double value = 4;
+}
+
+message FMELDecision {
+  optional string session_id = 1;
+  optional string agent_id = 2;
+  optional int64 decision_point = 3;
+  optional string stage = 4;
+  optional int64 timestamp = 5;           // microseconds since epoch
+  optional int64 bar_time = 6;            // microseconds since epoch
+  optional string action = 7;
+  optional double portfolio_value = 8;
+  optional double portfolio_cash = 9;
+  repeated DataAccessed data_accessed = 10;
+  optional int64 access_count = 11;
+  repeated EventTimelineEntry event_timeline = 12;
+  repeated Position positions = 13;
+}

@@ -27,9 +27,10 @@ We use Backtrader's Analyzer pattern instead of Observer because:
 4. Analyzers have explicit stop() for cleanup
 
 BigQuery Integration:
-Decisions are batched (10 records or 5 seconds) to reduce API calls.
-Each decision includes a unified event_timeline with all data accesses
-and trades that map directly to BigQuery's schema (see bigquery_schema.json).
+Decisions are streamed in real-time using BigQuery Storage Write API for
+non-blocking, high-performance writes. Each decision includes a unified
+event_timeline with all data accesses and trades that map directly to
+BigQuery's schema (see bigquery_schema.json and fmel_decision.proto).
 """
 
 import backtrader as bt
@@ -42,6 +43,9 @@ from typing import Optional, Dict, List
 from google.cloud import bigquery
 from google.cloud import pubsub_v1
 from google.api_core import retry
+from google.cloud.bigquery_storage_v1 import BigQueryWriteClient, types
+from google.protobuf import descriptor_pb2
+import fmel_decision_pb2
 
 from access_tracker import AccessTracker, AccessTrackingWrapper
 
@@ -80,14 +84,6 @@ class FMELAnalyzer(bt.Analyzer):
         # Pub/Sub topic for real-time decision streaming (e.g., "fmel-decisions")
         # If None, Pub/Sub publishing is disabled (BigQuery-only mode)
         ('pubsub_topic', None),
-
-        # Number of decisions to buffer before flushing to BigQuery
-        # Higher values reduce API calls but increase memory usage and data loss risk
-        ('batch_size', 10),
-
-        # Maximum seconds to wait before flushing partial batch
-        # Ensures timely writes even during slow trading periods
-        ('batch_timeout', 5.0),
 
         # AccessTracker instance for recording which data fields the agent reads
         # If None, data access tracking is disabled
@@ -130,18 +126,10 @@ class FMELAnalyzer(bt.Analyzer):
         # Set once in _setup_bigquery() and used for all batch inserts
         self.table_ref = None
 
-        # Buffer holding decisions waiting to be written to BigQuery
-        # Flushed when size reaches batch_size or after batch_timeout seconds
-        self._batch_buffer = []
-
-        # Thread lock protecting _batch_buffer from concurrent access
-        # Required because _flush_batch_async() runs on a Timer thread
-        self._batch_lock = threading.Lock()
-
-        # Timer that triggers batch flush after batch_timeout seconds of inactivity
-        # Ensures partial batches are written even during slow trading periods
-        # Cancelled and reset each time a new decision is added to the buffer
-        self._batch_timer = None
+        # Storage Write API client and stream for async writes
+        self._write_client = None
+        self._write_stream = None
+        self._append_rows_stream = None
 
         # Reference to the AccessTracker that records data field accesses
         # Shared with AccessTrackingWrapper instances that wrap data feeds
@@ -159,8 +147,11 @@ class FMELAnalyzer(bt.Analyzer):
 
     def start(self):
         """Called when analyzer starts"""
-        # Initialize BigQuery
+        # Initialize BigQuery (for table reference)
         self._setup_bigquery()
+
+        # Initialize Storage Write API (replaces legacy streaming)
+        self._setup_storage_write_api()
 
         # Initialize Pub/Sub for real-time streaming (if configured)
         if self.p.pubsub_topic:
@@ -430,6 +421,112 @@ class FMELAnalyzer(bt.Analyzer):
             self.pubsub_publisher = None
             self.pubsub_topic_path = None
 
+    def _setup_storage_write_api(self):
+        """Initialize BigQuery Storage Write API for async streaming."""
+        try:
+            self._write_client = BigQueryWriteClient()
+
+            # Use default stream for at-least-once delivery
+            parent = self._write_client.table_path(
+                self.p.project_id,
+                self.p.dataset_id,
+                self.p.table_id
+            )
+            self._write_stream = f"{parent}/_default"
+
+            # Create append rows stream with proto schema
+            proto_schema = types.ProtoSchema()
+            proto_schema.proto_descriptor.CopyFrom(
+                fmel_decision_pb2.FMELDecision.DESCRIPTOR.GetOptions().Extensions[
+                    descriptor_pb2.FieldDescriptorProto.DESCRIPTOR
+                ] if False else
+                fmel_decision_pb2.FMELDecision.DESCRIPTOR
+            )
+
+            request_template = types.AppendRowsRequest()
+            request_template.write_stream = self._write_stream
+            request_template.proto_rows.writer_schema.CopyFrom(proto_schema)
+
+            self._append_rows_stream = self._write_client.append_rows()
+
+            logger.info(f"Storage Write API initialized for {self.p.dataset_id}.{self.p.table_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to setup Storage Write API: {e}")
+            raise
+
+    def _decision_to_proto(self, decision: Dict) -> fmel_decision_pb2.FMELDecision:
+        """Convert decision dict to protobuf message."""
+        proto = fmel_decision_pb2.FMELDecision()
+
+        proto.session_id = decision['session_id']
+        proto.agent_id = decision['agent_id']
+        proto.decision_point = decision['decision_point']
+        proto.stage = decision['stage']
+
+        # Convert timestamps to microseconds since epoch
+        ts = datetime.fromisoformat(decision['timestamp'].replace('Z', '+00:00'))
+        proto.timestamp = int(ts.timestamp() * 1_000_000)
+
+        bar_ts = datetime.fromisoformat(decision['bar_time'].replace('Z', '+00:00'))
+        proto.bar_time = int(bar_ts.timestamp() * 1_000_000)
+
+        proto.action = decision['action']
+        proto.portfolio_value = decision['portfolio_value']
+        proto.portfolio_cash = decision['portfolio_cash']
+        proto.access_count = decision['access_count']
+
+        # Add data_accessed
+        for da in decision.get('data_accessed', []):
+            da_proto = proto.data_accessed.add()
+            da_proto.symbol = da.get('symbol', '')
+            if da.get('data_hash'):
+                da_proto.data_hash = da['data_hash']
+            for f in da.get('fields_accessed', []):
+                da_proto.fields_accessed.append(f)
+            for ap in da.get('access_patterns', []):
+                ap_proto = da_proto.access_patterns.add()
+                ap_proto.seq = ap.get('seq', 0)
+                ap_proto.timestamp_ns = ap.get('timestamp_ns', 0)
+                ap_proto.field = ap.get('field', '')
+                ap_proto.index = ap.get('index', 0)
+
+        # Add event_timeline
+        for e in decision.get('event_timeline', []):
+            e_proto = proto.event_timeline.add()
+            e_proto.seq = e.get('seq', 0)
+            e_proto.timestamp_ns = e.get('timestamp_ns', 0)
+            e_proto.event_type = e.get('event_type', '')
+            e_proto.symbol = e.get('symbol', '')
+            if e.get('field'):
+                e_proto.field = e['field']
+            if e.get('index') is not None:
+                e_proto.index = e['index']
+            if e.get('action'):
+                e_proto.action = e['action']
+            if e.get('size') is not None:
+                e_proto.size = e['size']
+            if e.get('price') is not None:
+                e_proto.price = e['price']
+            if e.get('value') is not None:
+                e_proto.value = e['value']
+            if e.get('commission') is not None:
+                e_proto.commission = e['commission']
+            if e.get('pnl') is not None:
+                e_proto.pnl = e['pnl']
+            if e.get('data_hash'):
+                e_proto.data_hash = e['data_hash']
+
+        # Add positions
+        for p in decision.get('positions', []):
+            p_proto = proto.positions.add()
+            p_proto.symbol = p['symbol']
+            p_proto.size = p['size']
+            p_proto.price = p['price']
+            p_proto.value = p['value']
+
+        return proto
+
     def _publish_to_pubsub(self, decision: Dict):
         """
         Publish decision to Pub/Sub for real-time streaming.
@@ -494,60 +591,27 @@ class FMELAnalyzer(bt.Analyzer):
             logger.warning(f"Pub/Sub publish failed: {e}")
 
     def _add_to_batch(self, decision: Dict):
-        """Add decision to batch with automatic flushing"""
-        with self._batch_lock:
-            self._batch_buffer.append(decision)
-
-            # Check if batch is full
-            if len(self._batch_buffer) >= self.p.batch_size:
-                self._flush_batch()
-            else:
-                # Reset timer for timeout-based flush
-                if self._batch_timer:
-                    self._batch_timer.cancel()
-                self._batch_timer = threading.Timer(
-                    self.p.batch_timeout,
-                    self._flush_batch_async
-                )
-                self._batch_timer.daemon = True
-                self._batch_timer.start()
-
-    def _flush_batch_async(self):
-        """Async wrapper for batch flushing"""
-        with self._batch_lock:
-            self._flush_batch()
-
-    def _flush_batch(self):
-        """Flush current batch to BigQuery"""
-        if not self._batch_buffer:
-            return
-
-        # Copy and clear buffer
-        decisions = list(self._batch_buffer)
-        self._batch_buffer.clear()
-
-        # Cancel timer
-        if self._batch_timer:
-            self._batch_timer.cancel()
-            self._batch_timer = None
-
-        # Write to BigQuery
+        """Stream decision to BigQuery via Storage Write API (non-blocking)."""
         try:
-            errors = self.bq_client.insert_rows_json(
-                self.table_ref,
-                decisions,
-                retry=retry.Retry(deadline=30)
-            )
+            # Convert to protobuf
+            proto = self._decision_to_proto(decision)
 
-            if errors:
-                logger.error(f"BigQuery insert errors: {errors}")
-            else:
-                logger.info(f"Flushed {len(decisions)} decisions to BigQuery")
+            # Create proto rows request
+            proto_data = types.ProtoRows()
+            proto_data.serialized_rows.append(proto.SerializeToString())
+
+            # Build the append request
+            request = types.AppendRowsRequest()
+            request.write_stream = self._write_stream
+            request.proto_rows.rows.CopyFrom(proto_data)
+
+            # Send async (non-blocking) - the gRPC streaming handles this
+            response = self._append_rows_stream.send(request)
+
+            logger.info(f"Streamed decision {decision['decision_point']} to BigQuery")
 
         except Exception as e:
-            logger.error(f"Failed to write to BigQuery: {e}")
-            # Re-add to buffer for retry
-            self._batch_buffer.extend(decisions)
+            logger.error(f"Failed to stream to BigQuery: {e}")
 
     def stop(self):
         """Called when analyzer stops"""
@@ -555,23 +619,15 @@ class FMELAnalyzer(bt.Analyzer):
         if self._current_decision:
             self._end_decision_point()
 
-        # Log session end (not written to BigQuery - doesn't match decisions schema)
-        logger.info(
-            f"Session ended - "
-            f"Final value: ${self.strategy.broker.getvalue():,.2f}, "
-            f"Final cash: ${self.strategy.broker.getcash():,.2f}, "
-            f"Total decisions: {self.decision_count}"
-        )
+        # Close Storage Write API stream
+        if self._append_rows_stream:
+            try:
+                self._append_rows_stream.close()
+                logger.info("Storage Write API stream closed")
+            except Exception as e:
+                logger.warning(f"Error closing Storage Write API stream: {e}")
 
-        # Flush any remaining batches
-        with self._batch_lock:
-            self._flush_batch()
-
-        # Cancel timer
-        if self._batch_timer:
-            self._batch_timer.cancel()
-
-        # Log summary
+        # Log session summary
         logger.info(
             f"FMEL session complete - "
             f"Session: {self.session_id}, "

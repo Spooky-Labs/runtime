@@ -13,6 +13,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Generate protobuf Python code for BigQuery Storage Write API
+RUN python -m grpc_tools.protoc -I. --python_out=. fmel_decision.proto
+
 # Create non-root user and copy models to staging location
 # Models will be copied to user's home at runtime (needed for HuggingFace lock files)
 # Priority: detected models (from GCS cache) > base image models

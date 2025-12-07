@@ -335,8 +335,6 @@ To run asset discovery manually:
             dataset_id=self.fmel_dataset,
             table_id=self.fmel_table,
             pubsub_topic='fmel-decisions',  # Real-time streaming to Firestore
-            batch_size=1,  # Write immediately - prevents 413 errors with many data feeds
-            batch_timeout=5.0,  # Or every 5 seconds, whichever comes first
             access_tracker=access_tracker,
             data_feeds=data_feeds  # Analyzer wraps feeds to track access
         )

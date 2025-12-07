@@ -14,7 +14,11 @@ alpaca-py
 # Google Cloud Services
 google-cloud-pubsub
 google-cloud-bigquery
+google-cloud-bigquery-storage>=2.22.0
 google-cloud-secret-manager
+
+# Proto compilation (for BigQuery Storage Write API)
+grpcio-tools
 
 # Cache & Storage
 redis
