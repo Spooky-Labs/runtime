@@ -435,14 +435,15 @@ class FMELAnalyzer(bt.Analyzer):
             self._write_stream = f"{parent}/_default"
 
             # Create proto schema - must convert Descriptor to DescriptorProto
+            # Use ._pb to access underlying protobuf (proto-plus wrappers don't have CopyFrom)
             proto_schema = types.ProtoSchema()
             proto_descriptor = descriptor_pb2.DescriptorProto()
             fmel_decision_pb2.FMELDecision.DESCRIPTOR.CopyToProto(proto_descriptor)
-            proto_schema.proto_descriptor.CopyFrom(proto_descriptor)
+            proto_schema._pb.proto_descriptor.CopyFrom(proto_descriptor)
 
             request_template = types.AppendRowsRequest()
             request_template.write_stream = self._write_stream
-            request_template.proto_rows.writer_schema.CopyFrom(proto_schema)
+            request_template._pb.proto_rows.writer_schema.CopyFrom(proto_schema._pb)
 
             self._append_rows_stream = self._write_client.append_rows()
 
@@ -594,13 +595,14 @@ class FMELAnalyzer(bt.Analyzer):
             proto = self._decision_to_proto(decision)
 
             # Create proto rows request
+            # Use ._pb to access underlying protobuf (proto-plus wrappers don't have CopyFrom)
             proto_data = types.ProtoRows()
-            proto_data.serialized_rows.append(proto.SerializeToString())
+            proto_data._pb.serialized_rows.append(proto.SerializeToString())
 
             # Build the append request
             request = types.AppendRowsRequest()
             request.write_stream = self._write_stream
-            request.proto_rows.rows.CopyFrom(proto_data)
+            request._pb.proto_rows.rows.CopyFrom(proto_data._pb)
 
             # Send async (non-blocking) - the gRPC streaming handles this
             response = self._append_rows_stream.send(request)
