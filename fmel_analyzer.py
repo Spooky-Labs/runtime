@@ -434,14 +434,11 @@ class FMELAnalyzer(bt.Analyzer):
             )
             self._write_stream = f"{parent}/_default"
 
-            # Create append rows stream with proto schema
+            # Create proto schema - must convert Descriptor to DescriptorProto
             proto_schema = types.ProtoSchema()
-            proto_schema.proto_descriptor.CopyFrom(
-                fmel_decision_pb2.FMELDecision.DESCRIPTOR.GetOptions().Extensions[
-                    descriptor_pb2.FieldDescriptorProto.DESCRIPTOR
-                ] if False else
-                fmel_decision_pb2.FMELDecision.DESCRIPTOR
-            )
+            proto_descriptor = descriptor_pb2.DescriptorProto()
+            fmel_decision_pb2.FMELDecision.DESCRIPTOR.CopyToProto(proto_descriptor)
+            proto_schema.proto_descriptor.CopyFrom(proto_descriptor)
 
             request_template = types.AppendRowsRequest()
             request_template.write_stream = self._write_stream
