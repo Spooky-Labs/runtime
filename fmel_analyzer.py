@@ -298,6 +298,15 @@ class FMELAnalyzer(bt.Analyzer):
         for feed_data in accessed_data:
             symbol = feed_data.get('symbol')
             for access in feed_data.get('access_patterns', []):
+                data_hash = access.get('data_hash')
+
+                # Log warning if DATA_ACCESS has no hash (should never happen for valid access)
+                if data_hash is None:
+                    logger.warning(
+                        f"FMEL traceability gap in event_timeline: "
+                        f"{symbol}.{access['field']}[{access['index']}] has no data_hash"
+                    )
+
                 timeline.append({
                     'timestamp_ns': access['timestamp_ns'],
                     'event_type': 'DATA_ACCESS',
@@ -312,7 +321,7 @@ class FMELAnalyzer(bt.Analyzer):
                     'pnl': None,
                     # Use per-access hash for correct lookback traceability
                     # When agent accesses data.close[-1], this is the hash of THAT bar
-                    'data_hash': access.get('data_hash')
+                    'data_hash': data_hash
                 })
 
         # Add trade events (already in _event_timeline from notify_order)

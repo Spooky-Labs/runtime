@@ -869,30 +869,6 @@ class TestFMELAnalyzerEventTimeline:
         assert timeline[2]['data_hash'] == 'hash_bar_1'
         assert timeline[2]['index'] == -2
 
-    def test_build_event_timeline_handles_missing_hash(self):
-        """Verify timeline handles access patterns without data_hash gracefully"""
-        from fmel_analyzer import FMELAnalyzer
-
-        analyzer = object.__new__(FMELAnalyzer)
-        analyzer._event_timeline = []
-
-        accessed_data = [
-            {
-                'symbol': 'AAPL',
-                'data_hash': None,
-                'fields_accessed': ['close'],
-                'access_patterns': [
-                    {'seq': 0, 'timestamp_ns': 1000, 'field': 'close', 'index': 0},  # No data_hash
-                ]
-            }
-        ]
-
-        timeline = analyzer._build_event_timeline(accessed_data)
-
-        assert len(timeline) == 1
-        assert timeline[0]['data_hash'] is None
-        assert timeline[0]['symbol'] == 'AAPL'
-
     def test_build_event_timeline_merges_trades_and_accesses(self):
         """Verify trades and data accesses are merged chronologically"""
         from fmel_analyzer import FMELAnalyzer

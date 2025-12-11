@@ -43,9 +43,12 @@ Example - News Data:
     # enabling full traceability even for historical access.
 """
 
-from typing import Dict, List, Any, Optional
-from collections import defaultdict
+import logging
 import time
+from collections import defaultdict
+from typing import Dict, List, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class AccessTracker:
@@ -165,7 +168,15 @@ class TrackedMarketLine:
         """Track array-style access like data.close[-1]"""
         # Look up hash from history (indices correspond 1:1 with Backtrader lines)
         abs_idx = len(self._hash_history) - 1 + index
-        data_hash = self._hash_history[abs_idx] if 0 <= abs_idx < len(self._hash_history) else None
+        in_bounds = 0 <= abs_idx < len(self._hash_history)
+        data_hash = self._hash_history[abs_idx] if in_bounds else None
+
+        # Log warning if in-bounds access has no hash (should never happen)
+        if in_bounds and data_hash is None:
+            logger.warning(
+                f"FMEL traceability gap: {self._wrapper._name}.{self._field_name}[{index}] "
+                f"has no data_hash (abs_idx={abs_idx})"
+            )
 
         self._wrapper._record_field_access(self._field_name, index, data_hash)
         return self._line[index]
@@ -201,7 +212,15 @@ class TrackedTextAccessor:
         # Look up hash for THIS article (not current)
         history = self._accessor._history
         abs_idx = len(history) - 1 + index
-        data_hash = history[abs_idx].get('data_hash') if 0 <= abs_idx < len(history) else None
+        in_bounds = 0 <= abs_idx < len(history)
+        data_hash = history[abs_idx].get('data_hash') if in_bounds else None
+
+        # Log warning if in-bounds access has no hash (should never happen)
+        if in_bounds and data_hash is None:
+            logger.warning(
+                f"FMEL traceability gap: {self._wrapper._name}.{self._field_name}[{index}] "
+                f"has no data_hash (abs_idx={abs_idx})"
+            )
 
         # Record with correct hash for this lookback position
         self._wrapper._record_field_access(self._field_name, index, data_hash)
@@ -234,7 +253,15 @@ class TrackedNewsLine:
         """Track array-style access like news.news_id[-1]"""
         # Look up hash from text history (indices correspond 1:1)
         abs_idx = len(self._history) - 1 + index
-        data_hash = self._history[abs_idx].get('data_hash') if 0 <= abs_idx < len(self._history) else None
+        in_bounds = 0 <= abs_idx < len(self._history)
+        data_hash = self._history[abs_idx].get('data_hash') if in_bounds else None
+
+        # Log warning if in-bounds access has no hash (should never happen)
+        if in_bounds and data_hash is None:
+            logger.warning(
+                f"FMEL traceability gap: {self._wrapper._name}.{self._field_name}[{index}] "
+                f"has no data_hash (abs_idx={abs_idx})"
+            )
 
         self._wrapper._record_field_access(self._field_name, index, data_hash)
         return self._line[index]
