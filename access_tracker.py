@@ -82,8 +82,10 @@ class AccessTracker:
             'seq': self.access_sequence,
             'timestamp_ns': time.time_ns(),
             'field': field,
-            'index': index
+            'index': index,
+            'data_hash': data_hash  # Per-access hash for lookback traceability
         })
+        # Also store at feed level for backward compatibility
         if data_hash:
             feed_data['data_hash'] = data_hash
         self.access_sequence += 1

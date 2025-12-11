@@ -297,7 +297,6 @@ class FMELAnalyzer(bt.Analyzer):
         # Add data access events from access_tracker
         for feed_data in accessed_data:
             symbol = feed_data.get('symbol')
-            data_hash = feed_data.get('data_hash')
             for access in feed_data.get('access_patterns', []):
                 timeline.append({
                     'timestamp_ns': access['timestamp_ns'],
@@ -311,7 +310,9 @@ class FMELAnalyzer(bt.Analyzer):
                     'value': None,
                     'commission': None,
                     'pnl': None,
-                    'data_hash': data_hash
+                    # Use per-access hash for correct lookback traceability
+                    # When agent accesses data.close[-1], this is the hash of THAT bar
+                    'data_hash': access.get('data_hash')
                 })
 
         # Add trade events (already in _event_timeline from notify_order)

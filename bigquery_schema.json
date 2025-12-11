@@ -106,6 +106,12 @@
             "type": "INTEGER",
             "mode": "REQUIRED",
             "description": "Array index (0 for current, -1 for previous)"
+          },
+          {
+            "name": "data_hash",
+            "type": "STRING",
+            "mode": "NULLABLE",
+            "description": "SHA-256 hash of the specific data point accessed. For lookback (index < 0), this is the hash of THAT historical bar, enabling full traceability."
           }
         ]
       }
