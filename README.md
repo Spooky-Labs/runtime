@@ -6,6 +6,7 @@ Production-ready algorithmic trading runtime for paper trading with real-time ma
 
 The Trading Runtime provides a complete infrastructure for running trading agents with:
 - **Live Market Data**: Real-time crypto and equity data via Google Pub/Sub
+- **Live News Data**: Real-time news with text lookback support (`news.headline[-1]`)
 - **Paper Trading**: Alpaca paper trading with portfolio management
 - **Explainability**: Foundation Model Explainability Layer (FMEL) tracking all decisions
 - **Production Design**: Async order management, graceful shutdown, and robust error handling
@@ -17,9 +18,12 @@ The Trading Runtime provides a complete infrastructure for running trading agent
 flowchart TB
     subgraph external["External Services"]
         PubSub[Google Pub/Sub<br/>Market Data Topics]
+        NewsPubSub[Google Pub/Sub<br/>News Data Topic]
+        GCS[Google Cloud Storage<br/>FMEL Content]
         Alpaca[Alpaca API<br/>Paper Trading]
         BigQuery[BigQuery<br/>FMEL Storage]
         Ingestor[Data Ingestors<br/>Market Data Publisher]
+        NewsIngestor[News Ingestor<br/>News Publisher]
     end
 
     subgraph core["Runtime Core"]
@@ -28,8 +32,10 @@ flowchart TB
     end
 
     subgraph data["Data Layer"]
-        SharedSub[SharedSubscriber<br/>1 sub per topic]
+        SharedSub[SharedSubscriber<br/>1 sub per market topic]
+        NewsSharedSub[NewsSharedSubscriber<br/>1 sub for news]
         DataFeed[PubSubMarketDataFeed<br/>Per-symbol buffers]
+        NewsFeed[NewsDataFeed<br/>ALPACA_NEWS]
         Broker[AlpacaPaperTradingBroker<br/>Order Management]
         FMEL[FMELAnalyzer<br/>Decision & Access Tracking]
     end
@@ -40,9 +46,14 @@ flowchart TB
     end
 
     Ingestor -->|Publishes| PubSub
+    NewsIngestor -->|Publishes| NewsPubSub
     PubSub -->|2 subs per agent| SharedSub
+    NewsPubSub -->|1 sub per agent| NewsSharedSub
+    NewsSharedSub -->|Fetches content| GCS
     SharedSub -->|Routes by symbol| DataFeed
+    NewsSharedSub -->|All news| NewsFeed
     DataFeed -->|Market Data| BT
+    NewsFeed -->|News Data| BT
 
     BT -->|Strategy Calls| Agent
     Agent -->|Buy/Sell Orders| Broker
@@ -51,15 +62,18 @@ flowchart TB
     Agent -->|Decisions| FMEL
     FMEL -->|Batch Writes| BigQuery
     DataFeed -->|Data Hash| FMEL
+    NewsFeed -->|Data Hash| FMEL
 
     Runner -->|Initializes| Config
     Config -->|Configures| DataFeed
+    Config -->|Configures| NewsFeed
     Config -->|Configures| Broker
     Config -->|Configures| FMEL
     Runner -->|Manages| BT
 
     Broker -.->|Background Thread<br/>Status Monitoring| Alpaca
     DataFeed -.->|Async Messages| PubSub
+    NewsSharedSub -.->|Async Messages| NewsPubSub
     FMEL -.->|Batch Timer| BigQuery
 ```
 
@@ -228,7 +242,102 @@ class Agent(bt.Strategy):
             # Make trading decisions based on all available data
 ```
 
-### 4. FMELAnalyzer (`fmel_analyzer.py`)
+### 4. NewsDataFeed (`news_data_feed.py`)
+
+**Purpose**: Streams real-time news from Google Pub/Sub to Backtrader with text lookback support.
+
+**Key Features**:
+- **Standard OHLCV Lines**: Zeros for plotting/observer compatibility
+- **News Numeric Lines**: `news_id`, `created_at_ts`, `updated_at_ts`, `symbol_count`
+- **Text Lookback**: Access previous articles via `news.headline[-1]`, `news.symbols[-2]`, etc.
+- **FMEL Integration**: Each text access records the correct `data_hash` for that article
+
+**Architecture**:
+```
+Pub/Sub (news-data topic)
+        │
+        ▼
+NewsSharedSubscriber (1 sub per agent)
+  - Fetches full content from GCS via data_hash
+  - Caches content to avoid duplicate fetches
+        │
+        ▼
+NewsDataFeed (ALPACA_NEWS)
+  - Numeric lines for Backtrader indexing
+  - _text_history list for text lookback
+```
+
+**Text Lookback Design**:
+
+Since Backtrader lines only store floats, text content is stored in `_text_history`:
+
+```python
+# As articles arrive, _text_history grows (newest at end):
+# [article1, article2, article3]
+#  ↑ oldest              ↑ newest
+
+# Backtrader indexing conversion:
+# [0]  = current  → _text_history[-1]
+# [-1] = previous → _text_history[-2]
+
+# Formula: abs_idx = len(_text_history) - 1 + backtrader_idx
+```
+
+**Agent Usage**:
+```python
+class Agent(bt.Strategy):
+    def __init__(self):
+        self.news = self.getdatabyname('ALPACA_NEWS')
+
+    def next(self):
+        # Skip news in market data loop
+        for d in self.datas:
+            if d._name == 'ALPACA_NEWS':
+                continue
+            # ... market trading logic
+
+        # Process news
+        if len(self.news) > 0:
+            # Current article
+            headline = self.news.headline[0]
+            symbols = self.news.symbols[0]  # Returns List[str]
+
+            # Previous article (lookback)
+            if len(self.news) > 1:
+                prev_headline = self.news.headline[-1]
+
+            # Numeric fields
+            news_id = self.news.news_id[0]
+            created_ts = self.news.created_at_ts[0]
+
+            # React to news
+            for symbol in symbols:
+                if symbol in [d._name for d in self.datas]:
+                    market_data = self.getdatabyname(symbol)
+                    if 'earnings beat' in headline.lower():
+                        self.buy(data=market_data, size=10)
+```
+
+**Text Fields Available**:
+| Field | Type | Description |
+|-------|------|-------------|
+| `headline` | string | Article headline |
+| `summary` | string | Article summary |
+| `content` | string | Full article content |
+| `author` | string | Article author |
+| `url` | string | Article URL |
+| `source` | string | News source (e.g., Benzinga) |
+| `symbols` | List[str] | Related/mentioned symbols |
+
+**Numeric Lines**:
+| Line | Type | Description |
+|------|------|-------------|
+| `news_id` | int | Article ID |
+| `created_at_ts` | float | Unix timestamp of creation |
+| `updated_at_ts` | float | Unix timestamp of last update |
+| `symbol_count` | int | Number of symbols mentioned |
+
+### 5. FMELAnalyzer (`fmel_analyzer.py`)
 
 **Purpose**: Memory-efficient tracking of trading decisions with field-level data access for complete explainability.
 
@@ -322,16 +431,20 @@ class FMELAnalyzer(bt.Analyzer):
 }
 ```
 
-### 5. Access Tracker (`access_tracker.py`)
+### 6. Access Tracker (`access_tracker.py`)
 
-**Purpose**: Provides field-level tracking of data access for complete explainability.
+**Purpose**: Provides field-level tracking of data access for complete explainability, including news lookback.
 
 **Key Components**:
 - **AccessTracker**: Central coordinator for tracking field access
 - **AccessTrackingWrapper**: Transparent proxy for data feeds
-- **TrackedLine**: Wrapper for individual data lines (OHLC fields)
+- **TrackedLine**: Wrapper for market data lines (OHLCV fields)
+- **TrackedTextAccessor**: Wrapper for news text fields with hash lookup for lookback
+- **TrackedNewsLine**: Wrapper for news numeric lines with hash lookup for lookback
 
 **How It Works**:
+
+For market data:
 1. Data feeds are wrapped with AccessTrackingWrapper
 2. When agents access fields (e.g., `data.close[0]`), the wrapper records:
    - Which field was accessed (close, high, low, volume, etc.)
@@ -339,14 +452,40 @@ class FMELAnalyzer(bt.Analyzer):
    - Timestamp and sequence number
 3. FMELAnalyzer collects this data for each decision point
 
+For news data with lookback:
+1. When agent accesses `news.headline[-1]`, TrackedTextAccessor:
+   - Looks up the `data_hash` for THAT specific article (not current)
+   - Records the field, index, and correct hash
+2. This enables full traceability: "Agent looked at previous article (hash: abc123)"
+
 ```python
-# Example: Agent accessing data triggers tracking
+# Market data tracking
 class Agent(bt.Strategy):
     def next(self):
         for data in self.datas:
             close = data.close[0]  # Tracked: field="close", index=0
             prev = data.close[-1]  # Tracked: field="close", index=-1
-            high = data.high[0]    # Tracked: field="high", index=0
+
+        # News data tracking (with correct hash for each lookback position)
+        news = self.getdatabyname('ALPACA_NEWS')
+        headline = news.headline[0]   # Tracked: field="headline", index=0, hash=current
+        prev = news.headline[-1]      # Tracked: field="headline", index=-1, hash=previous
+```
+
+**FMEL Record Example**:
+```json
+{
+  "data_accessed": [
+    {
+      "symbol": "ALPACA_NEWS",
+      "fields_accessed": ["headline"],
+      "access_patterns": [
+        {"seq": 0, "field": "headline", "index": 0, "data_hash": "abc123"},
+        {"seq": 1, "field": "headline", "index": -1, "data_hash": "xyz789"}
+      ]
+    }
+  ]
+}
 ```
 
 ## Configuration
@@ -521,14 +660,19 @@ kubectl logs -l app=trading-agent -f
 Exchange → Ingestor → Pub/Sub Topic → SharedSubscriber (2 subs/agent) → Routes by symbol → DataFeed Buffers → Backtrader
 ```
 
-### 2. Trading Decision Pipeline
+### 2. News Data Pipeline
+```
+Alpaca News → News Ingestor → Pub/Sub (news-data) → NewsSharedSubscriber (1 sub/agent) → GCS Fetch → NewsDataFeed → Backtrader
+```
+
+### 3. Trading Decision Pipeline
 ```
 Backtrader → Agent.next() → Prediction → Buy/Sell → Broker → Alpaca API
 ```
 
-### 3. Explainability Pipeline
+### 4. Explainability Pipeline
 ```
-Agent Decision + Market Hash + Portfolio State → FMEL → Batch → BigQuery
+Agent Decision + Market/News Hash + Portfolio State → FMEL → Batch → BigQuery
 ```
 
 ## Production Features
@@ -635,6 +779,18 @@ GROUP BY action;
   - Fix: Ensure buffer references are cached at registration time, not in callback
 - Subscription quota exhausted = Too many orphaned subscriptions
   - Clean up: `gcloud pubsub subscriptions list | grep 'feed-' | xargs -P 20 -I {} gcloud pubsub subscriptions delete {}`
+
+**News Data Feed Issues**:
+- No news arriving:
+  - Check news-data Pub/Sub topic has messages
+  - Verify NewsSharedSubscriber subscription exists: `gcloud pubsub subscriptions list | grep news-data`
+  - Check FMEL_BUCKET environment variable is set correctly
+- Empty text fields:
+  - Verify GCS bucket has article content at `data_hash` paths
+  - Check NewsFMELFetcher logs for fetch errors
+- News lookback returning empty strings:
+  - `len(news.headline)` returns number of articles in history
+  - `text_history_size` param controls how many articles are kept (default: 1000)
 
 **Library Compatibility**:
 - Match exact versions from backtesting container
