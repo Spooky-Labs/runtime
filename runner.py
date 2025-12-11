@@ -37,8 +37,12 @@ import redis
 # - agent: Contains the actual trading strategy (replaceable by user code)
 # - fmel_analyzer: Records all decisions to BigQuery for explainability
 # - access_tracker: Tracks which data fields the agent looked at
+# - news_data_feed: Streams news from Pub/Sub into Backtrader format
+# - news_shared_subscriber: Manages shared Pub/Sub subscription for news
 from data_feed import PubSubMarketDataFeed
 from shared_subscriber import SharedSubscriber
+from news_data_feed import NewsDataFeed
+from news_shared_subscriber import NewsSharedSubscriber
 from broker import AlpacaPaperTradingBroker
 from agent.agent import Agent
 from fmel_analyzer import FMELAnalyzer
@@ -301,6 +305,28 @@ To run asset discovery manually:
             self.logger.debug(f"Added feed: {symbol} → {topic}")
 
         # =====================================================================
+        # NEWS DATA FEEDS
+        # One feed per news source. Agent accesses via:
+        #   news = self.getdatabyname('ALPACA_NEWS')
+        # =====================================================================
+        news_feeds = []
+
+        # Alpaca News Feed
+        alpaca_news_feed = NewsDataFeed(
+            project_id=self.project_id,
+            source_name='ALPACA',
+            agent_id=self.agent_id,
+            buffer_size=500
+        )
+        self.cerebro.adddata(alpaca_news_feed, name='ALPACA_NEWS')
+        news_feeds.append(alpaca_news_feed)
+        self.logger.info("Added news feed: ALPACA_NEWS")
+
+        # Future: Add other news sources here
+        # bloomberg_news_feed = NewsDataFeed(project_id=..., source_name='BLOOMBERG', ...)
+        # self.cerebro.adddata(bloomberg_news_feed, name='BLOOMBERG_NEWS')
+
+        # =====================================================================
         # STRATEGY
         # Add the trading strategy. This is imported from agent/agent.py and
         # contains the actual trading logic (when to buy/sell).
@@ -336,7 +362,7 @@ To run asset discovery manually:
             table_id=self.fmel_table,
             pubsub_topic='fmel-decisions',  # Real-time streaming to Firestore
             access_tracker=access_tracker,
-            data_feeds=data_feeds  # Analyzer wraps feeds to track access
+            data_feeds=data_feeds + news_feeds  # Include news in FMEL tracking
         )
 
     def run(self):
@@ -420,6 +446,13 @@ To run asset discovery manually:
             self.logger.info("SharedSubscriber cleanup complete")
         except Exception as e:
             self.logger.error(f"Error cleaning up SharedSubscriber: {e}")
+
+        # Clean up NewsSharedSubscriber instances - this deletes the news Pub/Sub subscriptions.
+        try:
+            NewsSharedSubscriber.cleanup_all()
+            self.logger.info("NewsSharedSubscriber cleanup complete")
+        except Exception as e:
+            self.logger.error(f"Error cleaning up NewsSharedSubscriber: {e}")
 
         # Note: Analyzer.stop() is called automatically by Backtrader's run().
         # This triggers FMEL to flush any remaining batched decisions.

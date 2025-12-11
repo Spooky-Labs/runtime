@@ -18,20 +18,28 @@ How It Works:
 3. AccessTracker collects all accesses for the current decision point
 4. FMEL Analyzer writes this to BigQuery with each decision record
 
-Example:
+Tracking Classes:
+- TrackedLine: Standard OHLCV lines (market data feeds)
+- TrackedTextAccessor: News text fields (headline, content, etc.) with lookback support
+- TrackedNewsLine: News numeric lines (news_id, created_at_ts, etc.) with lookback support
+
+Lookback Access:
+For news data, agents can look back in time: news.headline[-1] returns the previous
+article's headline. The tracking system records the correct data_hash for each
+lookback position, enabling full traceability.
+
+Example - Market Data:
     # In agent's next() method:
     price = self.data.close[0]  # Tracked: field='close', index=0
     prev = self.data.close[-1]  # Tracked: field='close', index=-1
-    high = self.data.high[0]    # Tracked: field='high', index=0
 
-    # FMEL will record: {
-    #   'fields_accessed': ['close', 'high'],
-    #   'access_patterns': [
-    #     {'seq': 0, 'field': 'close', 'index': 0},
-    #     {'seq': 1, 'field': 'close', 'index': -1},
-    #     {'seq': 2, 'field': 'high', 'index': 0}
-    #   ]
-    # }
+Example - News Data:
+    news = self.getdatabyname('ALPACA_NEWS')
+    headline = news.headline[0]       # Tracked: field='headline', index=0, data_hash=current
+    prev_headline = news.headline[-1] # Tracked: field='headline', index=-1, data_hash=previous
+
+    # FMEL records the correct data_hash for each lookback position,
+    # enabling full traceability even for historical access.
 """
 
 from typing import Dict, List, Any, Optional
@@ -133,6 +141,75 @@ class TrackedLine:
         return repr(self._line)
 
 
+class TrackedTextAccessor:
+    """
+    Wrapper for _TextAccessor that records access on __getitem__.
+    Looks up data_hash from _text_history for correct FMEL tracking of lookback.
+
+    When agent accesses news.headline[-1], we need to record the hash of THAT
+    previous article, not the current one. This class handles that lookup.
+    """
+
+    def __init__(self, text_accessor, wrapper: 'AccessTrackingWrapper', field_name: str):
+        self._accessor = text_accessor
+        self._wrapper = wrapper
+        self._field_name = field_name
+
+    def __getitem__(self, index: int):
+        """Track indexed access like news.headline[0] or news.headline[-1]"""
+        # Look up hash for THIS article (not current)
+        history = self._accessor._history
+        abs_idx = len(history) - 1 + index
+        data_hash = history[abs_idx].get('data_hash') if 0 <= abs_idx < len(history) else None
+
+        # Record with correct hash for this lookback position
+        self._wrapper._record_field_access(self._field_name, index, data_hash)
+        return self._accessor[index]
+
+    def __len__(self):
+        """Number of articles available for lookback"""
+        return len(self._accessor)
+
+    def __repr__(self):
+        return f"TrackedTextAccessor({self._field_name})"
+
+
+class TrackedNewsLine:
+    """
+    Wrapper for news numeric lines (news_id, created_at_ts, etc.).
+    Looks up data_hash from _text_history since indices correspond 1:1.
+
+    Each _load() call advances both Backtrader lines AND appends to _text_history,
+    so we can use _text_history to look up the correct hash for any index.
+    """
+
+    def __init__(self, line_obj, wrapper: 'AccessTrackingWrapper', field_name: str, history: list):
+        self._line = line_obj
+        self._wrapper = wrapper
+        self._field_name = field_name
+        self._history = history  # Reference to NewsDataFeed._text_history
+
+    def __getitem__(self, index: int):
+        """Track array-style access like news.news_id[-1]"""
+        # Look up hash from text history (indices correspond 1:1)
+        abs_idx = len(self._history) - 1 + index
+        data_hash = self._history[abs_idx].get('data_hash') if 0 <= abs_idx < len(self._history) else None
+
+        self._wrapper._record_field_access(self._field_name, index, data_hash)
+        return self._line[index]
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped line"""
+        return getattr(self._line, name)
+
+    def __len__(self):
+        """Forward length calls"""
+        return len(self._line)
+
+    def __repr__(self):
+        return f"TrackedNewsLine({self._field_name})"
+
+
 class AccessTrackingWrapper:
     """
     Transparent proxy wrapper for data feeds that tracks field access.
@@ -142,10 +219,30 @@ class AccessTrackingWrapper:
     to avoid issues with Backtrader's metaclass system.
     """
 
-    # Standard OHLCV fields
+    # Standard OHLCV fields (for market data feeds)
     TRACKED_FIELDS = {
         'open', 'high', 'low', 'close', 'volume',
-        'openinterest', 'datetime'
+        'openinterest', 'datetime',
+    }
+
+    # News text fields - accessed via _TextAccessor with [index] support
+    # These return TrackedTextAccessor for FMEL tracking with correct data_hash
+    NEWS_TEXT_FIELDS = {
+        'headline',     # string - Headline or title
+        'summary',      # string - Summary text (may be first sentence)
+        'author',       # string - Original author
+        'content',      # string - Full content (may contain HTML)
+        'url',          # string - Article URL
+        'symbols',      # List[str] - Related/mentioned symbols
+        'source',       # string - News source (e.g., Benzinga)
+    }
+
+    # News numeric lines - use TrackedNewsLine for FMEL tracking with correct data_hash
+    NEWS_NUMERIC_LINES = {
+        'news_id',          # int - News article ID
+        'created_at_ts',    # float - Unix timestamp of creation
+        'updated_at_ts',    # float - Unix timestamp of last update
+        'symbol_count',     # int - Number of symbols mentioned
     }
 
     # Line-based attributes that should be tracked
@@ -165,10 +262,20 @@ class AccessTrackingWrapper:
         object.__setattr__(self, '_tracker', tracker)
         object.__setattr__(self, '_wrapped_lines', {})  # Cache for wrapped line objects
 
-    def _record_field_access(self, field: str, index: int):
-        """Record that a field was accessed"""
-        # Get the current data hash if available
-        data_hash = getattr(self._feed, 'current_data_hash', None)
+    def _record_field_access(self, field: str, index: int, data_hash: Optional[str] = None):
+        """
+        Record that a field was accessed.
+
+        Args:
+            field: Field name accessed
+            index: Array index accessed (0 for current, -1 for previous, etc.)
+            data_hash: Optional hash override. If None, uses feed's current_data_hash.
+                       For lookback access (index < 0), callers should provide the
+                       correct hash for that historical position.
+        """
+        # Use provided hash, or fall back to feed's current_data_hash
+        if data_hash is None:
+            data_hash = getattr(self._feed, 'current_data_hash', None)
 
         # Record the access
         self._tracker.record_access(
@@ -185,7 +292,18 @@ class AccessTrackingWrapper:
         # Get the actual attribute from the wrapped feed
         attr = getattr(self._feed, name)
 
-        # Check if this is a tracked field (OHLCV or dynamic)
+        # News text fields - wrap _TextAccessor with TrackedTextAccessor
+        # This enables proper hash lookup for lookback access like news.headline[-1]
+        if name in self.NEWS_TEXT_FIELDS:
+            return TrackedTextAccessor(attr, self, name)
+
+        # News numeric lines - use TrackedNewsLine with hash lookup from _text_history
+        # This enables proper hash lookup for lookback access like news.news_id[-1]
+        if name in self.NEWS_NUMERIC_LINES:
+            history = getattr(self._feed, '_text_history', [])
+            return TrackedNewsLine(attr, self, name, history)
+
+        # Standard OHLCV tracked fields (for market data feeds)
         if name in self.TRACKED_FIELDS:
             # Wrap line objects to track array access
             if name not in self._wrapped_lines:
