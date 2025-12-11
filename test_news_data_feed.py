@@ -822,5 +822,132 @@ class TestAccessTrackingWrapperMarketData:
         assert patterns[1]['index'] == -1
 
 
+class TestFMELAnalyzerEventTimeline:
+    """Test that FMELAnalyzer._build_event_timeline uses per-access hash"""
+
+    def test_build_event_timeline_uses_per_access_hash(self):
+        """
+        Verify that _build_event_timeline uses the data_hash from each access pattern,
+        not the feed-level hash. This is critical for lookback traceability.
+        """
+        from fmel_analyzer import FMELAnalyzer
+        from unittest.mock import MagicMock
+
+        # Create a mock analyzer (avoid full Backtrader setup)
+        analyzer = object.__new__(FMELAnalyzer)
+        analyzer._event_timeline = []  # No trades for this test
+
+        # Simulate accessed_data with per-access hashes (as returned by AccessTracker)
+        accessed_data = [
+            {
+                'symbol': 'BTC/USD',
+                'data_hash': 'feed_level_hash',  # This should be IGNORED
+                'fields_accessed': ['close'],
+                'access_patterns': [
+                    {'seq': 0, 'timestamp_ns': 1000, 'field': 'close', 'index': 0, 'data_hash': 'hash_bar_3'},
+                    {'seq': 1, 'timestamp_ns': 2000, 'field': 'close', 'index': -1, 'data_hash': 'hash_bar_2'},
+                    {'seq': 2, 'timestamp_ns': 3000, 'field': 'close', 'index': -2, 'data_hash': 'hash_bar_1'},
+                ]
+            }
+        ]
+
+        # Build the timeline
+        timeline = analyzer._build_event_timeline(accessed_data)
+
+        # Verify each event uses the PER-ACCESS hash, not the feed-level hash
+        assert len(timeline) == 3
+
+        # Current bar access should have hash_bar_3
+        assert timeline[0]['data_hash'] == 'hash_bar_3'
+        assert timeline[0]['index'] == 0
+
+        # Previous bar access should have hash_bar_2
+        assert timeline[1]['data_hash'] == 'hash_bar_2'
+        assert timeline[1]['index'] == -1
+
+        # Two bars ago should have hash_bar_1
+        assert timeline[2]['data_hash'] == 'hash_bar_1'
+        assert timeline[2]['index'] == -2
+
+    def test_build_event_timeline_handles_missing_hash(self):
+        """Verify timeline handles access patterns without data_hash gracefully"""
+        from fmel_analyzer import FMELAnalyzer
+
+        analyzer = object.__new__(FMELAnalyzer)
+        analyzer._event_timeline = []
+
+        accessed_data = [
+            {
+                'symbol': 'AAPL',
+                'data_hash': None,
+                'fields_accessed': ['close'],
+                'access_patterns': [
+                    {'seq': 0, 'timestamp_ns': 1000, 'field': 'close', 'index': 0},  # No data_hash
+                ]
+            }
+        ]
+
+        timeline = analyzer._build_event_timeline(accessed_data)
+
+        assert len(timeline) == 1
+        assert timeline[0]['data_hash'] is None
+        assert timeline[0]['symbol'] == 'AAPL'
+
+    def test_build_event_timeline_merges_trades_and_accesses(self):
+        """Verify trades and data accesses are merged chronologically"""
+        from fmel_analyzer import FMELAnalyzer
+
+        analyzer = object.__new__(FMELAnalyzer)
+        # Simulate a trade that happened between data accesses
+        analyzer._event_timeline = [
+            {
+                'timestamp_ns': 2500,  # Between access 2 and 3
+                'event_type': 'TRADE',
+                'symbol': 'BTC/USD',
+                'action': 'BUY',
+                'size': 1.0,
+                'price': 50000.0,
+                'field': None,
+                'index': None,
+                'value': 50000.0,
+                'commission': 0.0,
+                'pnl': None,
+                'data_hash': None
+            }
+        ]
+
+        accessed_data = [
+            {
+                'symbol': 'BTC/USD',
+                'data_hash': None,
+                'fields_accessed': ['close'],
+                'access_patterns': [
+                    {'seq': 0, 'timestamp_ns': 1000, 'field': 'close', 'index': 0, 'data_hash': 'hash1'},
+                    {'seq': 1, 'timestamp_ns': 2000, 'field': 'high', 'index': 0, 'data_hash': 'hash1'},
+                    {'seq': 2, 'timestamp_ns': 3000, 'field': 'low', 'index': 0, 'data_hash': 'hash1'},
+                ]
+            }
+        ]
+
+        timeline = analyzer._build_event_timeline(accessed_data)
+
+        # Should be sorted by timestamp: access, access, TRADE, access
+        assert len(timeline) == 4
+        assert timeline[0]['event_type'] == 'DATA_ACCESS'
+        assert timeline[0]['field'] == 'close'
+        assert timeline[1]['event_type'] == 'DATA_ACCESS'
+        assert timeline[1]['field'] == 'high'
+        assert timeline[2]['event_type'] == 'TRADE'
+        assert timeline[2]['action'] == 'BUY'
+        assert timeline[3]['event_type'] == 'DATA_ACCESS'
+        assert timeline[3]['field'] == 'low'
+
+        # Verify sequence numbers are assigned after sorting
+        assert timeline[0]['seq'] == 1
+        assert timeline[1]['seq'] == 2
+        assert timeline[2]['seq'] == 3
+        assert timeline[3]['seq'] == 4
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v', '--tb=short'])
