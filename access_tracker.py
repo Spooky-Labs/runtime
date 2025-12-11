@@ -19,19 +19,20 @@ How It Works:
 4. FMEL Analyzer writes this to BigQuery with each decision record
 
 Tracking Classes:
-- TrackedLine: Standard OHLCV lines (market data feeds)
+- TrackedLine: Fallback for feeds without hash history
+- TrackedMarketLine: Market data OHLCV lines with hash lookup for lookback
 - TrackedTextAccessor: News text fields (headline, content, etc.) with lookback support
 - TrackedNewsLine: News numeric lines (news_id, created_at_ts, etc.) with lookback support
 
 Lookback Access:
-For news data, agents can look back in time: news.headline[-1] returns the previous
-article's headline. The tracking system records the correct data_hash for each
-lookback position, enabling full traceability.
+Both market and news data support lookback with correct hash tracking.
+When agent accesses data.close[-1] or news.headline[-1], the tracking system
+records the correct data_hash for that specific bar/article, not the current one.
 
 Example - Market Data:
     # In agent's next() method:
-    price = self.data.close[0]  # Tracked: field='close', index=0
-    prev = self.data.close[-1]  # Tracked: field='close', index=-1
+    price = self.data.close[0]  # Tracked: field='close', index=0, data_hash=current_bar
+    prev = self.data.close[-1]  # Tracked: field='close', index=-1, data_hash=previous_bar
 
 Example - News Data:
     news = self.getdatabyname('ALPACA_NEWS')
@@ -139,6 +140,44 @@ class TrackedLine:
     def __repr__(self):
         """Forward representation"""
         return repr(self._line)
+
+
+class TrackedMarketLine:
+    """
+    Wrapper for market data lines (OHLCV) that looks up data_hash from _hash_history.
+
+    Each _load() call advances both Backtrader lines AND appends to _hash_history,
+    so we can use _hash_history to look up the correct hash for any index.
+
+    This ensures that when agent accesses data.close[-1], FMEL records the hash
+    of THAT previous bar, not the current bar's hash.
+    """
+
+    def __init__(self, line_obj, wrapper: 'AccessTrackingWrapper', field_name: str, hash_history: list):
+        self._line = line_obj
+        self._wrapper = wrapper
+        self._field_name = field_name
+        self._hash_history = hash_history  # Reference to PubSubMarketDataFeed._hash_history
+
+    def __getitem__(self, index: int):
+        """Track array-style access like data.close[-1]"""
+        # Look up hash from history (indices correspond 1:1 with Backtrader lines)
+        abs_idx = len(self._hash_history) - 1 + index
+        data_hash = self._hash_history[abs_idx] if 0 <= abs_idx < len(self._hash_history) else None
+
+        self._wrapper._record_field_access(self._field_name, index, data_hash)
+        return self._line[index]
+
+    def __getattr__(self, name):
+        """Forward all other attributes to the wrapped line"""
+        return getattr(self._line, name)
+
+    def __len__(self):
+        """Forward length calls"""
+        return len(self._line)
+
+    def __repr__(self):
+        return f"TrackedMarketLine({self._field_name})"
 
 
 class TrackedTextAccessor:
@@ -304,18 +343,29 @@ class AccessTrackingWrapper:
             return TrackedNewsLine(attr, self, name, history)
 
         # Standard OHLCV tracked fields (for market data feeds)
+        # Use TrackedMarketLine if _hash_history is available for correct lookback tracking
         if name in self.TRACKED_FIELDS:
-            # Wrap line objects to track array access
             if name not in self._wrapped_lines:
-                self._wrapped_lines[name] = TrackedLine(attr, self, name)
+                hash_history = getattr(self._feed, '_hash_history', None)
+                if hash_history is not None:
+                    # Market data feed with hash history - use TrackedMarketLine
+                    self._wrapped_lines[name] = TrackedMarketLine(attr, self, name, hash_history)
+                else:
+                    # Fallback for feeds without hash history
+                    self._wrapped_lines[name] = TrackedLine(attr, self, name)
             return self._wrapped_lines[name]
 
         # Check for dynamic fields (added by data_feed.py)
         # These would be any line attributes not in standard fields
         if hasattr(attr, '__getitem__') and hasattr(self._feed.lines, name):
-            # This is a dynamic field line
             if name not in self._wrapped_lines:
-                self._wrapped_lines[name] = TrackedLine(attr, self, name)
+                hash_history = getattr(self._feed, '_hash_history', None)
+                if hash_history is not None:
+                    # Market data feed with hash history - use TrackedMarketLine
+                    self._wrapped_lines[name] = TrackedMarketLine(attr, self, name, hash_history)
+                else:
+                    # Fallback for feeds without hash history
+                    self._wrapped_lines[name] = TrackedLine(attr, self, name)
             return self._wrapped_lines[name]
 
         # Handle lines.X access pattern
@@ -330,7 +380,15 @@ class AccessTrackingWrapper:
         Track direct array access like data[0].
         This accesses the close line by default in Backtrader.
         """
-        self._record_field_access('close', index)
+        # Look up correct hash for this index (supports lookback)
+        hash_history = getattr(self._feed, '_hash_history', None)
+        if hash_history is not None:
+            abs_idx = len(hash_history) - 1 + index
+            data_hash = hash_history[abs_idx] if 0 <= abs_idx < len(hash_history) else None
+        else:
+            data_hash = None
+
+        self._record_field_access('close', index, data_hash)
         return self._feed[index]
 
     def __setattr__(self, name, value):

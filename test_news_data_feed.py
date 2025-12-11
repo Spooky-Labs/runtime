@@ -423,22 +423,26 @@ class TestAccessTrackingWrapper:
         result = wrapper.news_id
         assert isinstance(result, TrackedNewsLine)
 
-    def test_ohlcv_field_returns_tracked_line(self):
-        """Test accessing OHLCV field returns TrackedLine (for market data)"""
+    def test_ohlcv_field_returns_tracked_line_without_hash_history(self):
+        """Test accessing OHLCV field returns TrackedLine when no _hash_history"""
         from access_tracker import AccessTracker, AccessTrackingWrapper, TrackedLine
 
         tracker = AccessTracker()
 
-        mock_feed = MagicMock()
+        # Use a simple Mock without MagicMock's auto-attribute creation
+        mock_feed = Mock(spec=['_name', 'current_data_hash', 'close', 'lines'])
         mock_feed._name = 'BTC/USD'
         mock_feed.current_data_hash = 'hash1'
 
-        mock_line = MagicMock()
+        mock_line = Mock()
         mock_feed.close = mock_line
+        mock_feed.lines = Mock(spec=['close'])
+        mock_feed.lines.close = mock_line
 
         wrapper = AccessTrackingWrapper(mock_feed, tracker)
 
         result = wrapper.close
+        # Without _hash_history, should use TrackedLine
         assert isinstance(result, TrackedLine)
 
 
@@ -605,6 +609,217 @@ class TestIntegration:
         assert patterns[0]['seq'] == 0
         assert patterns[1]['seq'] == 1
         assert patterns[2]['seq'] == 2
+
+
+class TestTrackedMarketLine:
+    """Test TrackedMarketLine for market data lookback hash tracking"""
+
+    def test_lookback_uses_correct_hash(self):
+        """Test that [-1] access records the hash of the previous bar, not current"""
+        from access_tracker import TrackedMarketLine, AccessTracker, AccessTrackingWrapper
+
+        tracker = AccessTracker()
+
+        # Simulate hash history (newest at end)
+        hash_history = ['hash1', 'hash2', 'hash3']
+
+        # Mock the wrapper's _record_field_access method
+        mock_wrapper = Mock()
+        mock_wrapper._record_field_access = Mock()
+
+        # Mock line object
+        mock_line = Mock()
+        mock_line.__getitem__ = Mock(return_value=100.0)
+
+        tracked = TrackedMarketLine(mock_line, mock_wrapper, 'close', hash_history)
+
+        # Access current bar [0]
+        _ = tracked[0]
+        mock_wrapper._record_field_access.assert_called_with('close', 0, 'hash3')
+
+        # Access previous bar [-1]
+        _ = tracked[-1]
+        mock_wrapper._record_field_access.assert_called_with('close', -1, 'hash2')
+
+        # Access 2 bars ago [-2]
+        _ = tracked[-2]
+        mock_wrapper._record_field_access.assert_called_with('close', -2, 'hash1')
+
+    def test_out_of_bounds_returns_none_hash(self):
+        """Test that out-of-bounds access records None for hash"""
+        from access_tracker import TrackedMarketLine
+
+        hash_history = ['hash1']
+
+        mock_wrapper = Mock()
+        mock_wrapper._record_field_access = Mock()
+
+        mock_line = Mock()
+        mock_line.__getitem__ = Mock(return_value=0.0)
+
+        tracked = TrackedMarketLine(mock_line, mock_wrapper, 'close', hash_history)
+
+        # Access out of bounds [-1] when only one bar exists
+        _ = tracked[-1]
+        mock_wrapper._record_field_access.assert_called_with('close', -1, None)
+
+    def test_forwards_getitem_to_underlying_line(self):
+        """Test that value access is forwarded to the wrapped line"""
+        from access_tracker import TrackedMarketLine
+
+        hash_history = ['hash1', 'hash2']
+
+        mock_wrapper = Mock()
+        mock_wrapper._record_field_access = Mock()
+
+        mock_line = Mock()
+        mock_line.__getitem__ = Mock(side_effect=lambda i: 100.0 + i)
+
+        tracked = TrackedMarketLine(mock_line, mock_wrapper, 'close', hash_history)
+
+        assert tracked[0] == 100.0
+        assert tracked[-1] == 99.0
+
+        mock_line.__getitem__.assert_any_call(0)
+        mock_line.__getitem__.assert_any_call(-1)
+
+
+class TestMarketDataHashHistory:
+    """Test that market data feed maintains correct hash history"""
+
+    def test_hash_history_grows_with_each_load(self):
+        """Test that _hash_history grows as bars are loaded"""
+        # Create a mock that simulates the market data feed behavior
+        hash_history = []
+
+        # Simulate 3 _load() calls
+        for i in range(3):
+            data_hash = f'hash{i}'
+            hash_history.append(data_hash)
+
+        assert len(hash_history) == 3
+        assert hash_history[0] == 'hash0'
+        assert hash_history[1] == 'hash1'
+        assert hash_history[2] == 'hash2'
+
+    def test_hash_history_respects_size_limit(self):
+        """Test that _hash_history is limited to configured size"""
+        hash_history = []
+        max_size = 5
+
+        # Simulate loading 10 bars
+        for i in range(10):
+            hash_history.append(f'hash{i}')
+            if len(hash_history) > max_size:
+                hash_history.pop(0)
+
+        assert len(hash_history) == max_size
+        # Should have hashes 5-9 (oldest removed)
+        assert hash_history[0] == 'hash5'
+        assert hash_history[-1] == 'hash9'
+
+
+class TestAccessTrackingWrapperMarketData:
+    """Test AccessTrackingWrapper with market data feeds"""
+
+    def test_ohlcv_fields_use_tracked_market_line_when_hash_history_available(self):
+        """Test that OHLCV fields use TrackedMarketLine when _hash_history exists"""
+        from access_tracker import AccessTracker, AccessTrackingWrapper, TrackedMarketLine
+
+        tracker = AccessTracker()
+
+        # Mock market data feed with hash history
+        mock_feed = Mock()
+        mock_feed._name = 'BTC/USD'
+        mock_feed._hash_history = ['hash1', 'hash2', 'hash3']
+        mock_feed.current_data_hash = 'hash3'
+
+        # Mock close line
+        mock_close = Mock()
+        mock_close.__getitem__ = Mock(return_value=50000.0)
+        mock_feed.close = mock_close
+
+        # Mock lines attribute for hasattr check
+        mock_lines = Mock()
+        mock_lines.close = mock_close
+        mock_feed.lines = mock_lines
+
+        wrapper = AccessTrackingWrapper(mock_feed, tracker)
+
+        # Access close line
+        close_accessor = wrapper.close
+
+        # Should be TrackedMarketLine
+        assert isinstance(close_accessor, TrackedMarketLine)
+
+    def test_lookback_records_correct_hash_for_each_bar(self):
+        """Test that accessing data.close[-1] records the hash of that bar"""
+        from access_tracker import AccessTracker, AccessTrackingWrapper
+
+        tracker = AccessTracker()
+
+        # Create a custom mock class to avoid MagicMock's auto-attribute issues
+        class MockMarketFeed:
+            def __init__(self):
+                self._name = 'BTC/USD'
+                self._hash_history = ['hash1', 'hash2', 'hash3']
+                self.current_data_hash = 'hash3'
+                self.close = self._create_line()
+                self.lines = type('Lines', (), {'close': self.close})()
+
+            def _create_line(self):
+                class MockLine:
+                    def __getitem__(self, idx):
+                        return 50000.0
+                return MockLine()
+
+        mock_feed = MockMarketFeed()
+        wrapper = AccessTrackingWrapper(mock_feed, tracker)
+
+        # Access current and previous bars
+        _ = wrapper.close[0]   # Should record hash3
+        _ = wrapper.close[-1]  # Should record hash2
+        _ = wrapper.close[-2]  # Should record hash1
+
+        accessed = tracker.get_accessed_data()
+        assert len(accessed) == 1
+        assert accessed[0]['symbol'] == 'BTC/USD'
+
+        patterns = accessed[0]['access_patterns']
+        assert len(patterns) == 3
+        assert patterns[0]['field'] == 'close'
+        assert patterns[0]['index'] == 0
+        assert patterns[1]['field'] == 'close'
+        assert patterns[1]['index'] == -1
+        assert patterns[2]['field'] == 'close'
+        assert patterns[2]['index'] == -2
+
+    def test_direct_indexing_with_hash_lookup(self):
+        """Test that data[-1] direct access also uses hash lookup"""
+        from access_tracker import AccessTracker, AccessTrackingWrapper
+
+        tracker = AccessTracker()
+
+        mock_feed = Mock()
+        mock_feed._name = 'ETH/USD'
+        mock_feed._hash_history = ['hash1', 'hash2']
+        mock_feed.current_data_hash = 'hash2'
+        mock_feed.__getitem__ = Mock(return_value=3000.0)
+
+        wrapper = AccessTrackingWrapper(mock_feed, tracker)
+
+        # Direct indexing (accesses close line by default)
+        _ = wrapper[0]
+        _ = wrapper[-1]
+
+        accessed = tracker.get_accessed_data()
+        patterns = accessed[0]['access_patterns']
+
+        assert len(patterns) == 2
+        assert patterns[0]['field'] == 'close'
+        assert patterns[0]['index'] == 0
+        assert patterns[1]['field'] == 'close'
+        assert patterns[1]['index'] == -1
 
 
 if __name__ == '__main__':

@@ -26,6 +26,10 @@ Key Design Decisions:
 
 3. **Content-Addressed Hashing**: Each data point includes a hash from the
    ingestor, enabling FMEL to correlate decisions with exact data versions.
+
+4. **Hash History for Lookback**: Maintains _hash_history list parallel to
+   Backtrader's line buffers. When agent accesses data.close[-1], FMEL can
+   look up the correct hash for that specific bar (not the current one).
 """
 
 import backtrader as bt
@@ -63,6 +67,7 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
         ('symbol', None),  # Symbol to subscribe to (e.g., BTC/USD)
         ('agent_id', None),  # Agent ID for subscription naming (Firebase agent ID)
         ('buffer_size', 1000),  # Max messages to buffer before dropping old ones
+        ('hash_history_size', 10000),  # How many bar hashes to keep for lookback
     )
 
     # States for feed lifecycle
@@ -91,6 +96,13 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
         # Hash of current data point - used by FMEL for traceability.
         # This lets us correlate decisions with exact data versions.
         self.current_data_hash = None
+
+        # Hash history for lookback support.
+        # Maintains hashes parallel to Backtrader's line buffers.
+        # When agent accesses data.close[-1], we can look up the correct hash.
+        # Uses same indexing as news _text_history: newest at end.
+        # Formula: abs_idx = len(_hash_history) - 1 + backtrader_idx
+        self._hash_history = []
 
         # Monitoring stats
         self._messages_processed = 0
@@ -173,6 +185,14 @@ class PubSubMarketDataFeed(bt.feeds.DataBase):
             # Store data hash for FMEL traceability.
             # This lets us correlate trading decisions with exact data versions.
             self.current_data_hash = data.get('data_hash')
+
+            # Append to hash history for lookback support.
+            # When agent accesses data.close[-1], we can look up the correct hash.
+            self._hash_history.append(self.current_data_hash)
+
+            # Limit history size (remove oldest when full)
+            if len(self._hash_history) > self.p.hash_history_size:
+                self._hash_history.pop(0)
 
             return True
 
