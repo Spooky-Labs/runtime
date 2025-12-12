@@ -1,4 +1,4 @@
-FROM gcr.io/the-farm-neutrino-315cd/base-with-models:0.1.5
+FROM gcr.io/the-farm-neutrino-315cd/base-with-models:latest
 
 WORKDIR /app
 
