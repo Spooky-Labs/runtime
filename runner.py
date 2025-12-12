@@ -41,8 +41,8 @@ import redis
 # - news_shared_subscriber: Manages shared Pub/Sub subscription for news
 from data_feed import PubSubMarketDataFeed
 from shared_subscriber import SharedSubscriber
-from news_data_feed import NewsDataFeed
-from news_shared_subscriber import NewsSharedSubscriber
+# from news_data_feed import NewsDataFeed
+# from news_shared_subscriber import NewsSharedSubscriber
 from broker import AlpacaPaperTradingBroker
 from agent.agent import Agent
 from fmel_analyzer import FMELAnalyzer
@@ -309,18 +309,18 @@ To run asset discovery manually:
         # One feed per news source. Agent accesses via:
         #   news = self.getdatabyname('ALPACA_NEWS')
         # =====================================================================
-        news_feeds = []
+        # news_feeds = []
 
         # Alpaca News Feed
-        alpaca_news_feed = NewsDataFeed(
-            project_id=self.project_id,
-            source_name='ALPACA',
-            agent_id=self.agent_id,
-            buffer_size=500
-        )
-        self.cerebro.adddata(alpaca_news_feed, name='ALPACA_NEWS')
-        news_feeds.append(alpaca_news_feed)
-        self.logger.info("Added news feed: ALPACA_NEWS")
+        # alpaca_news_feed = NewsDataFeed(
+        #     project_id=self.project_id,
+        #     source_name='ALPACA',
+        #     agent_id=self.agent_id,
+        #     buffer_size=500
+        # )
+        # self.cerebro.adddata(alpaca_news_feed, name='ALPACA_NEWS')
+        # news_feeds.append(alpaca_news_feed)
+        # self.logger.info("Added news feed: ALPACA_NEWS")
 
         # Future: Add other news sources here
         # bloomberg_news_feed = NewsDataFeed(project_id=..., source_name='BLOOMBERG', ...)
@@ -448,11 +448,11 @@ To run asset discovery manually:
             self.logger.error(f"Error cleaning up SharedSubscriber: {e}")
 
         # Clean up NewsSharedSubscriber instances - this deletes the news Pub/Sub subscriptions.
-        try:
-            NewsSharedSubscriber.cleanup_all()
-            self.logger.info("NewsSharedSubscriber cleanup complete")
-        except Exception as e:
-            self.logger.error(f"Error cleaning up NewsSharedSubscriber: {e}")
+        # try:
+        #     NewsSharedSubscriber.cleanup_all()
+        #     self.logger.info("NewsSharedSubscriber cleanup complete")
+        # except Exception as e:
+        #     self.logger.error(f"Error cleaning up NewsSharedSubscriber: {e}")
 
         # Note: Analyzer.stop() is called automatically by Backtrader's run().
         # This triggers FMEL to flush any remaining batched decisions.
